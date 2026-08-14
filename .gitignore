@@ -1,0 +1,27 @@
+.DS_Store
+cookie.txt
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+env/
+
+# Generated outputs
+*.pdf
+*.log
+capturas_tablatura/
+debug_comparacion_tablatura/
+video_cache/
+app_cache/
+
+# Local/editor files
+.idea/
+.vscode/
+.claude/
+
+# PyInstaller
+build/
+dist/
+*.spec
