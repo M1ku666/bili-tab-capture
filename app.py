@@ -1,16 +1,19 @@
 import contextlib
+import io
+import json
 import re
 import subprocess
+import tempfile
 import threading
 import time
 import uuid
 import os
 import webbrowser
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 from runtime_paths import data_dir
-from flask import Flask, jsonify, render_template, request, send_from_directory
+from flask import Flask, jsonify, render_template, request, send_file, send_from_directory
 from werkzeug.utils import secure_filename
 from PIL import Image, ImageColor, ImageOps
 
@@ -18,11 +21,11 @@ from tab_extractor import (
     BILIX_EXE,
     ExtractionOptions,
     ExtractionStats,
+    RESAMPLE,
     VideoMetadata,
     binarize_luminance,
     build_pdf_from_images,
     build_video_metadata,
-    crop_image_horizontal_centered,
     decode_bytes,
     download_bilibili_video,
     download_video,
@@ -35,6 +38,7 @@ from tab_extractor import (
     probe_youtube_metadata,
     save_video_frame,
     validate_crop_ratios,
+    validate_crop_x_ratios,
 )
 
 
@@ -268,13 +272,18 @@ def run_capture_job(job_id: str, payload: Dict[str, Any]) -> None:
                 raise ValueError("结束时间必须大于开始时间")
 
             crop_y_start = parse_float(payload.get("crop_y_start"), "crop_y_start", 0.0)
-            crop_y_end = parse_float(payload.get("crop_y_end"), "crop_y_end", 0.46)
+            crop_y_end = parse_float(payload.get("crop_y_end"), "crop_y_end", 1)
+            crop_x_start = parse_float(payload.get("crop_x_start"), "crop_x_start", 0.0)
+            crop_x_end = parse_float(payload.get("crop_x_end"), "crop_x_end", 1.0)
             validate_crop_ratios(crop_y_start, crop_y_end)
+            validate_crop_x_ratios(crop_x_start, crop_x_end)
 
             options = ExtractionOptions(
                 sample_every_sec=parse_float(payload.get("sample_every"), "sample_every", 2.0),
                 crop_y_start_ratio=crop_y_start,
                 crop_y_end_ratio=crop_y_end,
+                crop_x_start_ratio=crop_x_start,
+                crop_x_end_ratio=crop_x_end,
                 diff_threshold=parse_float(payload.get("diff_threshold"), "diff_threshold", 0.010),
                 compare_window=int(parse_float(payload.get("compare_window"), "compare_window", 1)),
                 debug_diffs=parse_bool(payload.get("debug_diffs")),
@@ -347,6 +356,8 @@ def run_capture_job(job_id: str, payload: Dict[str, Any]) -> None:
                 sample_every_sec=options.sample_every_sec,
                 crop_y_start_ratio=options.crop_y_start_ratio,
                 crop_y_end_ratio=options.crop_y_end_ratio,
+                crop_x_start_ratio=options.crop_x_start_ratio,
+                crop_x_end_ratio=options.crop_x_end_ratio,
                 hash_threshold=options.hash_threshold,
                 hash_size=options.hash_size,
                 diff_threshold=options.diff_threshold,
@@ -363,16 +374,53 @@ def run_capture_job(job_id: str, payload: Dict[str, Any]) -> None:
             if stats.captures_kept == 0:
                 raise RuntimeError("未能提取到有效画面。")
 
-            captures = [
-                {"file": p.name, "url": f"/api/captures/{job_id}/{p.name}"}
-                for p in sorted(crops_dir.glob("*.png"))
-            ]
+            times = {}
+            times_path = crops_dir / "times.json"
+            if times_path.exists():
+                try:
+                    with times_path.open("r", encoding="utf-8") as fh:
+                        times = json.load(fh)
+                except (OSError, ValueError):
+                    times = {}
+
+            captures = []
+            for p in sorted(crops_dir.glob("*.png")):
+                t = float(times.get(p.name, 0.0))
+                try:
+                    with Image.open(p) as img:
+                        w, h = img.size
+                except Exception:
+                    w, h = 0, 0
+                captures.append(
+                    {
+                        "file": p.name,
+                        "url": f"/api/captures/{job_id}/{p.name}",
+                        "t": t,
+                        "w": w,
+                        "h": h,
+                    }
+                )
+
+            capture_params = {
+                "crop_x_start": options.crop_x_start_ratio,
+                "crop_x_end": options.crop_x_end_ratio,
+                "crop_y_start": options.crop_y_start_ratio,
+                "crop_y_end": options.crop_y_end_ratio,
+                "diff_threshold": options.diff_threshold,
+                "band_half_width": options.band_half_width,
+                "compare_window": options.compare_window,
+                "min_band_pixels": options.min_band_pixels,
+                "target_tolerance": options.target_tolerance,
+            }
+
             update_job(
                 job_id,
                 status="done",
                 phase="done",
                 stats=stats.to_dict(),
                 captures=captures,
+                video_path=str(video_path),
+                capture_params=capture_params,
                 metadata=metadata_to_dict(metadata),
                 updated_at=time.time(),
             )
@@ -553,7 +601,7 @@ def start_captures():
             return json_error("结束时间必须大于开始时间。")
         validate_crop_ratios(
             parse_float(payload.get("crop_y_start"), "crop_y_start", 0.0),
-            parse_float(payload.get("crop_y_end"), "crop_y_end", 0.46),
+            parse_float(payload.get("crop_y_end"), "crop_y_end", 1),
         )
 
         job_id = uuid.uuid4().hex
@@ -587,6 +635,57 @@ def start_captures():
 @app.get("/api/captures/<job_id>/<path:filename>")
 def capture_file(job_id: str, filename: str):
     return send_from_directory(RUNS_DIR / job_id / "crops", filename, as_attachment=False)
+
+
+@app.get("/api/capture_preview/<job_id>/<path:filename>")
+def capture_preview(job_id: str, filename: str):
+    """按当前二值化/反色/配色设置实时返回处理后的单张截图。
+
+    变换顺序与 /api/pdf 完全一致（先反色，再二值化），保证预览所见即所得。
+    """
+    crops_dir = RUNS_DIR / job_id / "crops"
+    src = crops_dir / filename
+    if not src.exists():
+        return json_error("未知的截图。", 404)
+
+    invert = parse_bool(request.args.get("invert"))
+    binarize = parse_bool(request.args.get("binarize"))
+    note_dark = parse_bool(request.args.get("note_dark", "true"))
+
+    threshold_raw = request.args.get("threshold")
+    threshold = None
+    if threshold_raw not in (None, ""):
+        try:
+            threshold = int(float(threshold_raw))
+        except (TypeError, ValueError):
+            threshold = None
+
+    text_color = parse_hex_color(request.args.get("text_color"), "#181818")
+    bg_color = (request.args.get("bg_color") or "white").strip()
+    if not re.fullmatch(r"#[0-9a-fA-F]{6}|[a-zA-Z]+", bg_color):
+        bg_color = "white"
+
+    try:
+        img = Image.open(src).convert("RGB")
+        if invert:
+            img = ImageOps.invert(img)
+        if binarize:
+            thr = threshold
+            if not note_dark and thr is not None:
+                thr = 255 - thr
+            img = binarize_luminance(
+                img,
+                threshold=thr,
+                dark_note=note_dark,
+                foreground_rgb=hex_to_rgb(text_color),
+                background_rgb=ImageColor.getrgb(bg_color),
+            )
+        buf = io.BytesIO()
+        img.save(buf, "PNG")
+        buf.seek(0)
+        return send_file(buf, mimetype="image/png")
+    except Exception as exc:
+        return json_error(str(exc), 500)
 
 
 @app.post("/api/pdf")
@@ -627,17 +726,37 @@ def build_pdf():
         orientation = payload.get("orientation") or "portrait"
         if orientation not in ("portrait", "landscape"):
             orientation = "portrait"
+        align = payload.get("align") or "left"
+        if align not in ("left", "center"):
+            align = "left"
+
+        # 与 build_pdf_from_images 一致：横向纸张交换宽高，据此算内容区宽度。
+        pdf_w, pdf_h = 1654, 2339
+        if orientation == "landscape":
+            pdf_w, pdf_h = pdf_h, pdf_w
+        content_w = pdf_w - 2 * margin
 
         index = 0
         for item in payload.get("images") or []:
-            if not item.get("keep", True):
-                continue
             src_path = crops_dir / item.get("file", "")
             if not src_path.exists():
                 continue
-            left = float(item.get("left", 0.0))
-            right = float(item.get("right", 1.0))
             img = Image.open(src_path).convert("RGB")
+            crop = item.get("crop") or {}
+            c_l = max(0.0, min(1.0, float(crop.get("l", 0.0))))
+            c_t = max(0.0, min(1.0, float(crop.get("t", 0.0))))
+            c_r = max(c_l, min(1.0, float(crop.get("r", 1.0))))
+            c_b = max(c_t, min(1.0, float(crop.get("b", 1.0))))
+            iw, ih = img.size
+            # 先按原图缩放到内容区宽度（基准缩放），再裁切，保证裁切后缩放不变化。
+            scaled_h = int(round(ih * (content_w / iw)))
+            img = img.resize((content_w, scaled_h), RESAMPLE)
+            img = img.crop((
+                int(round(content_w * c_l)),
+                int(round(scaled_h * c_t)),
+                int(round(content_w * c_r)),
+                int(round(scaled_h * c_b)),
+            ))
             if invert:
                 img = ImageOps.invert(img)
             if binarize:
@@ -648,12 +767,11 @@ def build_pdf():
                     foreground_rgb=hex_to_rgb(text_color),
                     background_rgb=ImageColor.getrgb(bg_color),
                 )
-            img = crop_image_horizontal_centered(img, left, right, bg_color)
             img.save(final_dir / f"final_{index:04d}.png")
             index += 1
 
         if index == 0:
-            return json_error("没有保留任何截图。")
+            return json_error("没有可导出的截图。")
 
         metadata = build_video_metadata(
             raw_title=source_metadata.raw_title,
@@ -672,6 +790,8 @@ def build_pdf():
             bg_color=bg_color,
             text_color=text_color,
             orientation=orientation,
+            align=align,
+            fit_width=False,
         )
 
         update_job(job_id, pdf_name=output_pdf.name, pdf_url=f"/api/jobs/{job_id}/pdf")
@@ -680,6 +800,117 @@ def build_pdf():
             "pdf_name": output_pdf.name,
             "page_count": page_count,
         })
+    except Exception as exc:
+        return json_error(str(exc), 500)
+
+
+@app.post("/api/insert_captures")
+def insert_captures():
+    ensure_cache_dirs()
+    payload = request.get_json(force=True, silent=True) or {}
+    try:
+        job_id = payload.get("job_id")
+        with STORE_LOCK:
+            job = JOBS.get(job_id)
+        if job is None:
+            return json_error("未知的任务。", 404)
+
+        video_path_str = job.get("video_path")
+        capture_params = job.get("capture_params") or {}
+        if not video_path_str or not Path(video_path_str).exists():
+            return json_error("视频源不可用，无法插入。", 409)
+
+        t_start = parse_float(payload.get("t_start"), "t_start")
+        t_end = parse_float(payload.get("t_end"), "t_end")
+        if t_end <= t_start:
+            return json_error("t_end 必须大于 t_start。")
+
+        sample_every = parse_float(payload.get("sample_every"), "sample_every", 0.5)
+        eps = max(sample_every, 0.1)
+        start = t_start + eps
+        end = t_end - eps
+        if end <= start:
+            return jsonify({"captures": []})
+
+        crops_dir = RUNS_DIR / job_id / "crops"
+        crops_dir.mkdir(parents=True, exist_ok=True)
+
+        band_half_width = int(capture_params.get("band_half_width", 90))
+        min_band_pixels = int(capture_params.get("min_band_pixels", 20))
+        target_tolerance = int(capture_params.get("target_tolerance", 48))
+        diff_threshold = float(capture_params.get("diff_threshold", 0.010))
+        compare_window = int(capture_params.get("compare_window", 1))
+        crop_y_start = float(capture_params.get("crop_y_start", 0.0))
+        crop_y_end = float(capture_params.get("crop_y_end", 1))
+        crop_x_start = float(capture_params.get("crop_x_start", 0.0))
+        crop_x_end = float(capture_params.get("crop_x_end", 1.0))
+
+        with STORE_LOCK:
+            job_captures = list(job.get("captures", []))
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_crops = Path(tmp) / "crops"
+            stats = extract_unique_crops(
+                video_path=Path(video_path_str),
+                crops_dir=tmp_crops,
+                sample_every_sec=sample_every,
+                crop_y_start_ratio=crop_y_start,
+                crop_y_end_ratio=crop_y_end,
+                crop_x_start_ratio=crop_x_start,
+                crop_x_end_ratio=crop_x_end,
+                diff_threshold=diff_threshold,
+                compare_window=compare_window,
+                start_sec=start,
+                end_sec=end,
+                save_cleaned=False,
+                band_half_width=band_half_width,
+                min_band_pixels=min_band_pixels,
+                target_tolerance=target_tolerance,
+            )
+            if stats.captures_kept == 0:
+                return jsonify({"captures": []})
+
+            times = {}
+            times_path = tmp_crops / "times.json"
+            if times_path.exists():
+                try:
+                    with times_path.open("r", encoding="utf-8") as fh:
+                        times = json.load(fh)
+                except (OSError, ValueError):
+                    times = {}
+
+            new_captures = []
+            for p in sorted(tmp_crops.glob("*.png")):
+                t = float(times.get(p.name, 0.0))
+                out_name = f"ins_{uuid.uuid4().hex[:10]}_{p.name}"
+                try:
+                    with Image.open(p) as img:
+                        w, h = img.size
+                except Exception:
+                    continue
+                (crops_dir / out_name).write_bytes(p.read_bytes())
+                new_captures.append(
+                    {
+                        "file": out_name,
+                        "url": f"/api/captures/{job_id}/{out_name}",
+                        "t": t,
+                        "w": w,
+                        "h": h,
+                    }
+                )
+
+        insert_index = int(parse_float(payload.get("index"), "index", len(job_captures)))
+        insert_index = max(0, min(insert_index, len(job_captures)))
+        job_captures[insert_index:insert_index] = new_captures
+        update_job(
+            job_id,
+            captures=job_captures,
+            updated_at=time.time(),
+        )
+
+        return jsonify({"captures": new_captures})
+    except ValueError as exc:
+        return json_error(str(exc), 400)
     except Exception as exc:
         return json_error(str(exc), 500)
 

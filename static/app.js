@@ -1,8 +1,11 @@
 const state = {
   sourceId: null,
+  sourceUrl: null,
   duration: null,
   cropStart: 0,
-  cropEnd: 0.46,
+  cropEnd: 1,
+  cropLeft: 0,
+  cropRight: 1,
   activeHandle: null,
   timelineDrag: null,
   pollTimer: null,
@@ -18,8 +21,8 @@ const state = {
   stage: 1,
   maxStage: 1,
   captureJobId: null,
-  captures: [],
-  activeCrop: null,
+  images: [],
+  inserting: false,
 };
 
 const els = {
@@ -49,9 +52,13 @@ const els = {
   previewTimeHint: document.getElementById("previewTimeHint"),
   shadeTop: document.getElementById("shadeTop"),
   shadeBottom: document.getElementById("shadeBottom"),
+  shadeLeft: document.getElementById("shadeLeft"),
+  shadeRight: document.getElementById("shadeRight"),
   cropWindow: document.getElementById("cropWindow"),
   cropTop: document.getElementById("cropTop"),
   cropBottom: document.getElementById("cropBottom"),
+  cropLeft: document.getElementById("cropLeft"),
+  cropRight: document.getElementById("cropRight"),
   titleInput: document.getElementById("titleInput"),
   channelInput: document.getElementById("channelInput"),
   startMinInput: document.getElementById("startMinInput"),
@@ -85,8 +92,7 @@ const els = {
   logBox: document.getElementById("logBox"),
   adjustPanel: document.getElementById("adjustPanel"),
   donePanel: document.getElementById("donePanel"),
-  captureGrid: document.getElementById("captureGrid"),
-  batchCrop: document.getElementById("batchCrop"),
+  pageList: document.getElementById("pageList"),
   pageMargin: document.getElementById("pageMargin"),
   imageSpacing: document.getElementById("imageSpacing"),
   bgColor: document.getElementById("bgColor"),
@@ -180,6 +186,25 @@ function setStatus(element, message, mode = "") {
   element.dataset.mode = mode;
 }
 
+// 通知气泡：补插小节的加载/结果提示，短暂弹出后自动消失。
+function showToast(message, mode = "") {
+  let host = document.querySelector(".toast-host");
+  if (!host) {
+    host = document.createElement("div");
+    host.className = "toast-host";
+    document.body.appendChild(host);
+  }
+  const toast = document.createElement("div");
+  toast.className = "toast" + (mode ? ` toast-${mode}` : "");
+  toast.textContent = message;
+  host.appendChild(toast);
+  requestAnimationFrame(() => toast.classList.add("is-visible"));
+  setTimeout(() => {
+    toast.classList.remove("is-visible");
+    setTimeout(() => toast.remove(), 240);
+  }, 2600);
+}
+
 function setControlBusy(controls, busy) {
   controls.forEach((control) => {
     if (control) control.disabled = busy;
@@ -246,19 +271,66 @@ function currentEndTime() {
 function updateCropUi() {
   const top = state.cropStart * 100;
   const bottom = (1 - state.cropEnd) * 100;
+  const left = state.cropLeft * 100;
+  const right = (1 - state.cropRight) * 100;
   const height = (state.cropEnd - state.cropStart) * 100;
+  const width = (state.cropRight - state.cropLeft) * 100;
 
   els.shadeTop.style.height = `${top}%`;
   els.shadeBottom.style.height = `${bottom}%`;
+  els.shadeLeft.style.width = `${left}%`;
+  els.shadeLeft.style.top = `${top}%`;
+  els.shadeLeft.style.height = `${height}%`;
+  els.shadeRight.style.width = `${right}%`;
+  els.shadeRight.style.top = `${top}%`;
+  els.shadeRight.style.height = `${height}%`;
   els.cropWindow.style.top = `${top}%`;
+  els.cropWindow.style.left = `${left}%`;
   els.cropWindow.style.height = `${height}%`;
+  els.cropWindow.style.width = `${width}%`;
+
+  // 把手贴合裁剪区：上下把手横跨裁剪宽度、左右把手纵跨裁剪高度，
+  // 使把手（及其可视横条）相对裁剪区居中，而非相对整个视频。
+  els.cropTop.style.left = `${left}%`;
+  els.cropTop.style.width = `${width}%`;
   els.cropTop.style.top = `${top}%`;
+
+  els.cropBottom.style.left = `${left}%`;
+  els.cropBottom.style.width = `${width}%`;
   els.cropBottom.style.top = `${state.cropEnd * 100}%`;
+
+  els.cropLeft.style.top = `${top}%`;
+  els.cropLeft.style.height = `${height}%`;
+  els.cropLeft.style.left = `${left}%`;
+
+  els.cropRight.style.top = `${top}%`;
+  els.cropRight.style.height = `${height}%`;
+  els.cropRight.style.left = `${state.cropRight * 100}%`;
 }
 
 function pointerRatio(event) {
   const rect = els.previewFrame.getBoundingClientRect();
   return clamp((event.clientY - rect.top) / rect.height, 0, 1);
+}
+
+function pointerRatioX(event) {
+  const rect = els.previewFrame.getBoundingClientRect();
+  return clamp((event.clientX - rect.left) / rect.width, 0, 1);
+}
+
+const V_GAP = 0.05;
+const H_GAP = 0.01;
+
+function applyCropDrag(handle, ratioY, ratioX) {
+  if (handle === "top") {
+    state.cropStart = clamp(ratioY, 0, state.cropEnd - V_GAP);
+  } else if (handle === "bottom") {
+    state.cropEnd = clamp(ratioY, state.cropStart + V_GAP, 1);
+  } else if (handle === "left") {
+    state.cropLeft = clamp(ratioX, 0, state.cropRight - H_GAP);
+  } else {
+    state.cropRight = clamp(ratioX, state.cropLeft + H_GAP, 1);
+  }
 }
 
 function beginDrag(handle, event) {
@@ -269,14 +341,7 @@ function beginDrag(handle, event) {
 
 function dragCrop(event) {
   if (!state.activeHandle) return;
-  const ratio = pointerRatio(event);
-  const gap = 0.05;
-
-  if (state.activeHandle === "top") {
-    state.cropStart = clamp(ratio, 0, state.cropEnd - gap);
-  } else {
-    state.cropEnd = clamp(ratio, state.cropStart + gap, 1);
-  }
+  applyCropDrag(state.activeHandle, pointerRatio(event), pointerRatioX(event));
   updateCropUi();
 }
 
@@ -287,16 +352,21 @@ function endDrag() {
 function clickCrop(event) {
   if (event.target.closest(".crop-handle")) return;
   event.preventDefault();
-  const ratio = pointerRatio(event);
-  const gap = 0.05;
-  const distTop = Math.abs(ratio - state.cropStart);
-  const distBottom = Math.abs(ratio - state.cropEnd);
-  state.activeHandle = distTop <= distBottom ? "top" : "bottom";
-  if (state.activeHandle === "top") {
-    state.cropStart = clamp(ratio, 0, state.cropEnd - gap);
+  const ratioY = pointerRatio(event);
+  const ratioX = pointerRatioX(event);
+  const distTop = Math.abs(ratioY - state.cropStart);
+  const distBottom = Math.abs(ratioY - state.cropEnd);
+  const distLeft = Math.abs(ratioX - state.cropLeft);
+  const distRight = Math.abs(ratioX - state.cropRight);
+
+  let handle;
+  if (Math.min(distTop, distBottom) <= Math.min(distLeft, distRight)) {
+    handle = distTop <= distBottom ? "top" : "bottom";
   } else {
-    state.cropEnd = clamp(ratio, state.cropStart + gap, 1);
+    handle = distLeft <= distRight ? "left" : "right";
   }
+  state.activeHandle = handle;
+  applyCropDrag(handle, ratioY, ratioX);
   updateCropUi();
   event.currentTarget.setPointerCapture?.(event.pointerId);
 }
@@ -414,7 +484,7 @@ function applySource(source) {
   clearPreviewStatus();
   updatePreviewTimeHint();
   resetExtractionState();
-  state.captures = [];
+  state.images = [];
   state.captureJobId = null;
 
   state.sourceId = source.id;
@@ -422,6 +492,7 @@ function applySource(source) {
   const metadata = source.metadata || {};
   els.titleInput.value = metadata.display_title || metadata.raw_title || "";
   els.channelInput.value = metadata.channel || "";
+  state.sourceUrl = metadata.source_url || "";
   state.maxStage = 2;
   setStage(2);
 
@@ -499,6 +570,11 @@ function currentOrientation() {
   return checked ? checked.value : "portrait";
 }
 
+function currentAlign() {
+  const checked = document.querySelector('input[name="align"]:checked');
+  return checked ? checked.value : "left";
+}
+
 function syncThresholdControl() {
   els.binarizeSliderRow.classList.toggle("hidden", els.binarizeAuto.checked);
 }
@@ -519,6 +595,8 @@ function buildExtractPayload() {
     end: currentEndTime(),
     crop_y_start: state.cropStart,
     crop_y_end: state.cropEnd,
+    crop_x_start: state.cropLeft,
+    crop_x_end: state.cropRight,
     sample_every: numericValue(els.sampleEvery, 2),
     diff_threshold: numericValue(els.diffThreshold, 0.01),
     band_half_width: numericValue(els.bandHalfWidth, 90),
@@ -546,9 +624,9 @@ function renderJob(job) {
     clearInterval(state.pollTimer);
     state.pollTimer = null;
     els.generateButton.disabled = false;
-    renderCaptures(job.captures || []);
     state.maxStage = 3; // 重新生成截图后，顶栏「4 完成」不可直达
     setStage(3);
+    renderImages(job.captures || []);
   } else if (job.status === "error") {
     setStatus(els.extractStatus, job.error || "处理失败。", "error");
     clearInterval(state.pollTimer);
@@ -559,177 +637,546 @@ function renderJob(job) {
   }
 }
 
-function updateCropCard(cap) {
-  if (!cap._els) return;
-  const leftPct = cap.left * 100;
-  const rightPct = (1 - cap.right) * 100;
-  const widthPct = (cap.right - cap.left) * 100;
+const PAGE_W = 1654;
+const PAGE_H = 2339;
+const FOOTER_H = 80;
+const HEADER_RATIO = 0.2;
+const HEADER_TITLE_SIZE = 64; // 与后端 HEADER_TITLE_SIZE 一致（标题基准字号）
 
-  cap._els.shadeLeft.style.width = `${leftPct}%`;
-  cap._els.shadeRight.style.width = `${rightPct}%`;
-  cap._els.win.style.left = `${leftPct}%`;
-  cap._els.win.style.width = `${widthPct}%`;
-  cap._els.handleLeft.style.left = `${leftPct}%`;
-  cap._els.handleRight.style.left = `${cap.right * 100}%`;
+function currentLayoutOpts() {
+  return {
+    orientation: currentOrientation(),
+    margin: numericValue(els.pageMargin, 40),
+    spacing: numericValue(els.imageSpacing, 25),
+    bgColor: els.bgColor.value || "#ffffff",
+    textColor: els.textColor.value || "#181818",
+    title: els.titleInput.value.trim(),
+    channel: els.channelInput.value.trim(),
+    url: state.sourceUrl || "",
+  };
 }
 
-function updateAllCrops() {
-  state.captures.forEach(updateCropCard);
+function currentPageCssWidth() {
+  const avail = els.pageList ? els.pageList.clientWidth : 0;
+  return Math.max(280, Math.min(1600, avail || 700));
 }
 
-function renderCaptures(captures) {
-  state.captures = captures.map((capture) => ({
-    file: capture.file,
-    url: capture.url,
-    keep: true,
-    left: 0,
-    right: 1,
+function captureSrc(m) {
+  if (!els.binarizeInput.checked && !els.invertInput.checked) return m.url;
+  const params = new URLSearchParams();
+  params.set("invert", els.invertInput.checked ? "1" : "0");
+  params.set("binarize", els.binarizeInput.checked ? "1" : "0");
+  params.set("note_dark", currentNoteDark() ? "1" : "0");
+  params.set("text_color", els.textColor.value || "#181818");
+  params.set("bg_color", els.bgColor.value || "#ffffff");
+  if (!els.binarizeAuto.checked) params.set("threshold", els.binarizeThreshold.value);
+  return `/api/capture_preview/${state.captureJobId}/${m.file}?${params.toString()}`;
+}
+
+function layoutPages() {
+  const opts = currentLayoutOpts();
+  let pageW = PAGE_W;
+  let pageH = PAGE_H;
+  if (opts.orientation === "landscape") {
+    pageW = PAGE_H;
+    pageH = PAGE_W;
+  }
+  const contentW = pageW - 2 * opts.margin;
+  const hasHeader = Boolean(opts.title || opts.channel || opts.url);
+
+  const pages = [];
+  let currentPage = null;
+  let currentY = 0;
+
+  const startPage = (first) => {
+    currentPage = { first, hasHeader: first && hasHeader, items: [] };
+    pages.push(currentPage);
+    currentY = first && hasHeader ? Math.round(pageH * HEADER_RATIO) : opts.margin;
+  };
+
+  startPage(true);
+
+  const align = currentAlign();
+
+  for (let i = 0; i < state.images.length; i++) {
+    const m = state.images[i];
+    if (m.hidden) continue;
+    const crop = m.crop || { l: 0, t: 0, r: 1, b: 1 };
+    // 基准缩放：原图宽度铺满内容区；裁切后保留区缩放不变化，只按裁切比例缩小显示尺寸。
+    const aspect = (m.h || 1) / (m.w || 1);
+    const w = Math.max(1, Math.round(contentW * (crop.r - crop.l)));
+    const h = Math.max(1, Math.round(contentW * aspect * (crop.b - crop.t)));
+    const x = align === "center"
+      ? opts.margin + Math.round((contentW - w) / 2)
+      : opts.margin;
+
+    if (currentY + h + opts.margin + FOOTER_H > pageH) {
+      startPage(false);
+    }
+
+    currentPage.items.push({ index: i, m, w, h, x, y: currentY });
+    currentY += h + opts.spacing;
+  }
+
+  return { pages, pageW, pageH, opts };
+}
+
+function renderImages(images) {
+  state.images = (images || []).map((m) => ({
+    file: m.file,
+    url: m.url,
+    t: m.t ?? 0,
+    w: m.w,
+    h: m.h,
+    hidden: false,
+    flash: false,
+    crop: { l: 0, t: 0, r: 1, b: 1 },
   }));
-  els.captureGrid.innerHTML = "";
+  // 等调整面板显示、拿到真实宽度后再排版，保证 A4 预览一开始就撑满容器。
+  requestAnimationFrame(renderPages);
+}
 
-  state.captures.forEach((cap, index) => {
-    const card = document.createElement("div");
-    card.className = "capture-card";
-    card.dataset.index = String(index);
+const ICON_HIDE = '<svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M17.94 17.94A10.07 10.07 0 0 1 12 20c-7 0-11-8-11-8a18.45 18.45 0 0 1 5.06-5.94M9.9 4.24A9.12 9.12 0 0 1 12 4c7 0 11 8 11 8a18.5 18.5 0 0 1-2.16 3.19m-6.72-1.07a3 3 0 1 1-4.24-4.24"/><line x1="1" y1="1" x2="23" y2="23"/></svg>';
+const ICON_RESTORE = '<svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="15 3 21 3 21 9"/><polyline points="9 21 3 21 3 15"/><line x1="21" y1="3" x2="14" y2="10"/><line x1="3" y1="21" x2="10" y2="14"/></svg>';
+const ICON_INSERT_ABOVE = '<svg viewBox="0 0 1024 1024" width="18" height="18" fill="currentColor"><path d="M896 682.666667a74.666667 74.666667 0 0 0-74.666667-74.666667H202.666667A74.666667 74.666667 0 0 0 128 682.666667v138.666666c0 41.216 33.450667 74.666667 74.666667 74.666667h618.666666A74.666667 74.666667 0 0 0 896 821.333333V682.666667z m-74.666667-10.666667a10.666667 10.666667 0 0 1 10.666667 10.666667v138.666666a10.666667 10.666667 0 0 1-10.666667 10.666667H202.666667a10.666667 10.666667 0 0 1-10.666667-10.666667V682.666667a10.666667 10.666667 0 0 1 10.666667-10.666667h618.666666zM512 554.666667a213.333333 213.333333 0 1 1 0-426.666667 213.333333 213.333333 0 0 1 0 426.666667z m138.666667-213.333334a32 32 0 0 0-32-32h-74.666667V234.666667a32 32 0 0 0-64 0v74.666666H405.333333a32 32 0 0 0 0 64h74.666667v74.666667a32 32 0 0 0 64 0V373.333333h74.666667a32 32 0 0 0 32-32z"/></svg>';
+const ICON_INSERT_BELOW = '<svg viewBox="0 0 1024 1024" width="18" height="18" fill="currentColor"><path d="M896 341.333333a74.666667 74.666667 0 0 1-74.666667 74.666667H202.666667A74.666667 74.666667 0 0 1 128 341.333333V202.666667C128 161.450667 161.450667 128 202.666667 128h618.666666c41.216 0 74.666667 33.450667 74.666667 74.666667V341.333333z m-74.666667 10.666667A10.666667 10.666667 0 0 0 832 341.333333V202.666667a10.666667 10.666667 0 0 0-10.666667-10.666667H202.666667a10.666667 10.666667 0 0 0-10.666667 10.666667V341.333333c0 5.888 4.778667 10.666667 10.666667 10.666667h618.666666zM512 469.333333a213.333333 213.333333 0 1 0 0 426.666667 213.333333 213.333333 0 0 0 0-426.666667z m138.666667 213.333334a32 32 0 0 1-32 32h-74.666667v74.666666a32 32 0 0 1-64 0v-74.666666H405.333333a32 32 0 0 1 0-64h74.666667V576a32 32 0 0 1 64 0v74.666667h74.666667a32 32 0 0 1 32 32z"/></svg>';
+const ICON_CLONE = '<svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>';
 
-    const top = document.createElement("div");
-    top.className = "capture-top";
+function iconButton(svg, title, onClick) {
+  const btn = document.createElement("button");
+  btn.type = "button";
+  btn.className = "icon-btn";
+  btn.title = title;
+  btn.setAttribute("aria-label", title);
+  btn.innerHTML = svg;
+  btn.addEventListener("click", (event) => {
+    event.stopPropagation();
+    onClick(event);
+  });
+  return btn;
+}
 
-    const keepLabel = document.createElement("label");
-    keepLabel.className = "keep-toggle";
-    const keepCheckbox = document.createElement("input");
-    keepCheckbox.type = "checkbox";
-    keepCheckbox.checked = true;
-    keepCheckbox.addEventListener("change", () => {
-      cap.keep = keepCheckbox.checked;
-    });
-    keepLabel.appendChild(keepCheckbox);
-    keepLabel.appendChild(document.createTextNode(`保留截图 ${index + 1}`));
+function buildImage(item, scale) {
+  const { index, m, w, h, x, y } = item;
+  const crop = m.crop || { l: 0, t: 0, r: 1, b: 1 };
+  const cropW = Math.max(1e-6, crop.r - crop.l);
+  const cropH = Math.max(1e-6, crop.b - crop.t);
+  const dispW = w * scale;              // 裁切后显示尺寸
+  const dispH = h * scale;
+  const fullDispW = dispW / cropW;      // 原图按基准缩放后的完整显示尺寸
+  const fullDispH = dispH / cropH;
 
-    top.appendChild(keepLabel);
+  const wrap = document.createElement("div");
+  wrap.className = "image-item" + (m.flash ? " is-flash" : "");
+  wrap.style.left = `${x * scale}px`;
+  wrap.style.top = `${y * scale}px`;
+  wrap.style.width = `${dispW}px`;
+  wrap.style.height = `${dispH}px`;
 
-    const frame = document.createElement("div");
-    frame.className = "capture-frame";
+  // 裁切后仅显示保留区：原图按基准缩放平铺，外层 overflow 隐藏裁掉部分。
+  const img = document.createElement("img");
+  img.className = "image-img";
+  img.src = captureSrc(m);
+  img.alt = "";
+  img.draggable = false;
+  img.style.left = `${-(crop.l * fullDispW)}px`;
+  img.style.top = `${-(crop.t * fullDispH)}px`;
+  img.style.width = `${fullDispW}px`;
+  img.style.height = `${fullDispH}px`;
+  wrap.appendChild(img);
 
-    const img = document.createElement("img");
-    img.className = "capture-img";
-    img.src = cap.url;
-    img.alt = `截图 ${index + 1}`;
-    img.draggable = false;
-    frame.appendChild(img);
+  // 四边把手 + 遮罩：遮罩平时隐藏，拖动时显示被裁掉的部分。
+  const refs = buildCropOverlay();
+  [refs.shadeTop, refs.shadeBottom, refs.shadeLeft, refs.shadeRight, refs.win,
+    refs.handleTop, refs.handleBottom, refs.handleLeft, refs.handleRight]
+    .forEach((el) => wrap.appendChild(el));
 
-    const overlay = document.createElement("div");
-    overlay.className = "h-crop-overlay";
+  const actions = document.createElement("div");
+  actions.className = "image-actions";
+  actions.appendChild(iconButton(ICON_HIDE, "隐藏", () => hideImage(index)));
+  actions.appendChild(iconButton(ICON_RESTORE, "恢复裁剪", () => resetImageCrop(index)));
+  actions.appendChild(iconButton(ICON_CLONE, "克隆", () => cloneImage(index)));
+  actions.appendChild(iconButton(ICON_INSERT_ABOVE, "在上方插入", () => insertImages(index, "above")));
+  actions.appendChild(iconButton(ICON_INSERT_BELOW, "在下方插入", () => insertImages(index, "below")));
+  wrap.appendChild(actions);
 
-    const shadeLeft = document.createElement("div");
-    shadeLeft.className = "h-shade h-shade-left";
-    const shadeRight = document.createElement("div");
-    shadeRight.className = "h-shade h-shade-right";
-    const cropWindow = document.createElement("div");
-    cropWindow.className = "h-crop-window";
-
-    const handleLeft = document.createElement("button");
-    handleLeft.type = "button";
-    handleLeft.className = "h-handle h-handle-left";
-    handleLeft.addEventListener("pointerdown", (event) => beginHCrop(event, index, "left"));
-    const handleRight = document.createElement("button");
-    handleRight.type = "button";
-    handleRight.className = "h-handle h-handle-right";
-    handleRight.addEventListener("pointerdown", (event) => beginHCrop(event, index, "right"));
-
-    overlay.appendChild(shadeLeft);
-    overlay.appendChild(shadeRight);
-    overlay.appendChild(cropWindow);
-    overlay.appendChild(handleLeft);
-    overlay.appendChild(handleRight);
-    frame.appendChild(overlay);
-    frame.addEventListener("pointerdown", (event) => clickHCrop(event, index));
-
-    card.appendChild(top);
-    card.appendChild(frame);
-    els.captureGrid.appendChild(card);
-
-    cap._els = { shadeLeft, shadeRight, win: cropWindow, handleLeft, handleRight };
+  refs.handleTop.addEventListener("pointerdown", (e) => beginImageCropDrag(index, "top", refs, wrap, img, e));
+  refs.handleBottom.addEventListener("pointerdown", (e) => beginImageCropDrag(index, "bottom", refs, wrap, img, e));
+  refs.handleLeft.addEventListener("pointerdown", (e) => beginImageCropDrag(index, "left", refs, wrap, img, e));
+  refs.handleRight.addEventListener("pointerdown", (e) => beginImageCropDrag(index, "right", refs, wrap, img, e));
+  wrap.addEventListener("pointerdown", (event) => {
+    if (event.target.closest(".image-handle") || event.target.closest(".image-actions")) return;
+    clickImageCrop(index, refs, wrap, img, event);
   });
 
-  updateAllCrops();
+  return wrap;
 }
 
-function beginHCrop(event, index, side) {
+function buildCropOverlay() {
+  const make = (cls) => {
+    const el = document.createElement("div");
+    el.className = cls;
+    return el;
+  };
+  const makeHandle = (which) => {
+    const el = document.createElement("button");
+    el.type = "button";
+    el.className = `image-handle image-handle-${which}`;
+    el.setAttribute("aria-label", which);
+    return el;
+  };
+  return {
+    shadeTop: make("shade shade-top"),
+    shadeBottom: make("shade shade-bottom"),
+    shadeLeft: make("shade shade-left"),
+    shadeRight: make("shade shade-right"),
+    win: make("crop-window"),
+    handleTop: makeHandle("top"),
+    handleBottom: makeHandle("bottom"),
+    handleLeft: makeHandle("left"),
+    handleRight: makeHandle("right"),
+  };
+}
+
+function resetImageCrop(index) {
+  const m = state.images[index];
+  if (!m) return;
+  m.crop = { l: 0, t: 0, r: 1, b: 1 };
+  renderPages();
+  showToast("已恢复为裁切前大小", "success");
+}
+
+let cropDrag = null;
+
+// 最小裁切尺寸：中间四个按钮容器（.image-actions）各边 +15px，换算成原图归一化。
+function minCropGap(wrap, base, fullDispW, fullDispH) {
+  const actions = wrap.querySelector(".image-actions");
+  const minW = (actions ? actions.offsetWidth : 154) + 15;
+  const minH = (actions ? actions.offsetHeight : 34) + 15;
+  const baseW = Math.max(1e-6, base.r - base.l);
+  const baseH = Math.max(1e-6, base.b - base.t);
+  return {
+    w: Math.min(minW / fullDispW, baseW),
+    h: Math.min(minH / fullDispH, baseH),
+  };
+}
+
+function beginImageCropDrag(index, handle, refs, wrap, img, event) {
   event.preventDefault();
-  state.activeCrop = { index, side };
+  event.stopPropagation();
+  const m = state.images[index];
+  if (!m) return;
+  const c = m.crop || (m.crop = { l: 0, t: 0, r: 1, b: 1 });
+  const cropW = Math.max(1e-6, c.r - c.l);
+  const cropH = Math.max(1e-6, c.b - c.t);
+  cropDrag = {
+    index, handle, refs, wrap, img,
+    // 记录拖动开始时的裁切框，遮罩以它为基准、只向内（越裁越小）。
+    base: { l: c.l, t: c.t, r: c.r, b: c.b },
+    fullDispW: wrap.offsetWidth / cropW,
+    fullDispH: wrap.offsetHeight / cropH,
+    startValue: handle === "top" ? c.t : handle === "bottom" ? c.b : handle === "left" ? c.l : c.r,
+    startX: event.clientX,
+    startY: event.clientY,
+  };
+  const gap = minCropGap(wrap, cropDrag.base, cropDrag.fullDispW, cropDrag.fullDispH);
+  cropDrag.minW = gap.w;
+  cropDrag.minH = gap.h;
+  wrap.classList.add("is-cropping");
+  updateImageCropOverlay(refs, cropDrag.base, c);
   event.currentTarget.setPointerCapture?.(event.pointerId);
 }
 
-function dragHCrop(event) {
-  if (!state.activeCrop) return;
-  const { index, side } = state.activeCrop;
-  const cap = state.captures[index];
-  if (!cap) return;
-
-  const frame = els.captureGrid.querySelector(
-    `.capture-card[data-index="${index}"] .capture-frame`
-  );
-  if (!frame) return;
-  const rect = frame.getBoundingClientRect();
-  const ratio = clamp((event.clientX - rect.left) / rect.width, 0, 1);
-  const gap = 0.02;
-
-  if (side === "left") {
-    cap.left = clamp(ratio, 0, cap.right - gap);
-  } else {
-    cap.right = clamp(ratio, cap.left + gap, 1);
-  }
-
-  if (els.batchCrop.checked) {
-    state.captures.forEach((other) => {
-      if (side === "left") {
-        other.left = clamp(cap.left, 0, other.right - gap);
-      } else {
-        other.right = clamp(cap.right, other.left + gap, 1);
-      }
-    });
-  }
-
-  updateAllCrops();
-}
-
-function endHCrop() {
-  state.activeCrop = null;
-}
-
-function clickHCrop(event, index) {
-  const cap = state.captures[index];
-  if (!cap) return;
-  if (event.target.closest(".h-handle")) return;
-  const frame = els.captureGrid.querySelector(
-    `.capture-card[data-index="${index}"] .capture-frame`
-  );
-  if (!frame) return;
+function clickImageCrop(index, refs, wrap, img, event) {
   event.preventDefault();
-  const rect = frame.getBoundingClientRect();
-  const ratio = clamp((event.clientX - rect.left) / rect.width, 0, 1);
-  const gap = 0.02;
-  const distLeft = Math.abs(ratio - cap.left);
-  const distRight = Math.abs(ratio - cap.right);
-  const side = distLeft <= distRight ? "left" : "right";
-  state.activeCrop = { index, side };
-  if (side === "left") {
-    cap.left = clamp(ratio, 0, cap.right - gap);
+  const m = state.images[index];
+  if (!m) return;
+  const c = m.crop || (m.crop = { l: 0, t: 0, r: 1, b: 1 });
+  const rect = wrap.getBoundingClientRect();
+  const px = clamp((event.clientX - rect.left) / rect.width, 0, 1);
+  const py = clamp((event.clientY - rect.top) / rect.height, 0, 1);
+  // 映射回原图归一化坐标，点击吸附最近的边线（上下左右四边都支持）。
+  const rx = c.l + px * (c.r - c.l);
+  const ry = c.t + py * (c.b - c.t);
+
+  const distTop = Math.abs(ry - c.t);
+  const distBottom = Math.abs(ry - c.b);
+  const distLeft = Math.abs(rx - c.l);
+  const distRight = Math.abs(rx - c.r);
+  let handle;
+  if (Math.min(distTop, distBottom) <= Math.min(distLeft, distRight)) {
+    handle = distTop <= distBottom ? "top" : "bottom";
   } else {
-    cap.right = clamp(ratio, cap.left + gap, 1);
+    handle = distLeft <= distRight ? "left" : "right";
   }
-  if (els.batchCrop.checked) {
-    state.captures.forEach((other) => {
-      if (side === "left") {
-        other.left = clamp(cap.left, 0, other.right - gap);
-      } else {
-        other.right = clamp(cap.right, other.left + gap, 1);
+
+  const cropW = Math.max(1e-6, c.r - c.l);
+  const cropH = Math.max(1e-6, c.b - c.t);
+  // 点击吸附：把最近边线直接移到点击处，之后可继续拖动。
+  const snapped = handle === "top" || handle === "bottom" ? ry : rx;
+  cropDrag = {
+    index, handle, refs, wrap, img,
+    base: { l: c.l, t: c.t, r: c.r, b: c.b },
+    fullDispW: wrap.offsetWidth / cropW,
+    fullDispH: wrap.offsetHeight / cropH,
+    startValue: snapped,
+    startX: event.clientX,
+    startY: event.clientY,
+  };
+  const gap = minCropGap(wrap, cropDrag.base, cropDrag.fullDispW, cropDrag.fullDispH);
+  cropDrag.minW = gap.w;
+  cropDrag.minH = gap.h;
+  wrap.classList.add("is-cropping");
+  applyImageCropDragDelta(0, 0);
+  wrap.setPointerCapture?.(event.pointerId);
+}
+
+function applyImageCropDragDelta(dx, dy) {
+  if (!cropDrag) return;
+  const m = state.images[cropDrag.index];
+  if (!m) return;
+  const c = m.crop;
+  const base = cropDrag.base;
+  const fw = cropDrag.fullDispW;
+  const fh = cropDrag.fullDispH;
+  // 最小裁切限制（.image-actions + 15px）；向内裁切，边界不超过拖动开始时的裁切框。
+  const minW = cropDrag.minW || 0.01;
+  const minH = cropDrag.minH || 0.01;
+  if (cropDrag.handle === "top") c.t = clamp(cropDrag.startValue + dy / fh, base.t, c.b - minH);
+  else if (cropDrag.handle === "bottom") c.b = clamp(cropDrag.startValue + dy / fh, c.t + minH, base.b);
+  else if (cropDrag.handle === "left") c.l = clamp(cropDrag.startValue + dx / fw, base.l, c.r - minW);
+  else c.r = clamp(cropDrag.startValue + dx / fw, c.l + minW, base.r);
+  // 拖动期间图片大小保持不变，只更新遮罩与裁切窗；松手时才真正应用裁切。
+  updateImageCropOverlay(cropDrag.refs, base, c);
+}
+
+// 以拖动开始时的裁切框（base）为基准，把遮罩/裁切窗/把手定位到新的裁切边界。
+function updateImageCropOverlay(refs, base, c) {
+  const bw = Math.max(1e-6, base.r - base.l);
+  const bh = Math.max(1e-6, base.b - base.t);
+  const top = ((c.t - base.t) / bh) * 100;
+  const bottom = ((c.b - base.t) / bh) * 100;
+  const left = ((c.l - base.l) / bw) * 100;
+  const right = ((c.r - base.l) / bw) * 100;
+  const height = bottom - top;
+  const width = right - left;
+  const cx = (left + right) / 2;
+  const cy = (top + bottom) / 2;
+
+  refs.shadeTop.style.height = `${top}%`;
+  refs.shadeBottom.style.height = `${100 - bottom}%`;
+  refs.shadeLeft.style.width = `${left}%`;
+  refs.shadeLeft.style.top = `${top}%`;
+  refs.shadeLeft.style.height = `${height}%`;
+  refs.shadeRight.style.width = `${100 - right}%`;
+  refs.shadeRight.style.top = `${top}%`;
+  refs.shadeRight.style.height = `${height}%`;
+
+  refs.win.style.top = `${top}%`;
+  refs.win.style.left = `${left}%`;
+  refs.win.style.height = `${height}%`;
+  refs.win.style.width = `${width}%`;
+
+  refs.handleTop.style.left = `${cx}%`;
+  refs.handleTop.style.top = `${top}%`;
+  refs.handleBottom.style.left = `${cx}%`;
+  refs.handleBottom.style.top = `${bottom}%`;
+  refs.handleLeft.style.left = `${left}%`;
+  refs.handleLeft.style.top = `${cy}%`;
+  refs.handleRight.style.left = `${right}%`;
+  refs.handleRight.style.top = `${cy}%`;
+}
+
+function dragImageCrop(event) {
+  if (!cropDrag) return;
+  applyImageCropDragDelta(
+    event.clientX - cropDrag.startX,
+    event.clientY - cropDrag.startY
+  );
+}
+
+function endImageCropDrag() {
+  if (!cropDrag) return;
+  cropDrag.wrap.classList.remove("is-cropping");
+  cropDrag = null;
+  renderPages();
+}
+
+function renderPages() {
+  if (!els.pageList) return;
+  const { pages, pageW, pageH, opts } = layoutPages();
+  const cssW = currentPageCssWidth();
+  const scale = cssW / pageW;
+  els.pageList.innerHTML = "";
+
+  const total = pages.length;
+  pages.forEach((page, pageIndex) => {
+    const pageEl = document.createElement("div");
+    pageEl.className = "page";
+    pageEl.style.width = `${cssW}px`;
+    pageEl.style.height = `${Math.round(pageH * scale)}px`;
+    pageEl.style.background = opts.bgColor;
+    pageEl.style.color = opts.textColor;
+
+    if (page.hasHeader) {
+      const header = document.createElement("div");
+      header.className = "page-header";
+      header.style.height = `${Math.round(pageH * HEADER_RATIO * scale)}px`;
+      header.style.padding = `${Math.round(opts.margin * scale)}px`;
+      const titleSize = Math.round(HEADER_TITLE_SIZE * scale);
+      if (opts.title) {
+        const titleEl = document.createElement("div");
+        titleEl.className = "page-title";
+        titleEl.textContent = opts.title;
+        titleEl.style.fontSize = `${titleSize}px`;
+        titleEl.style.marginBottom = `${Math.round(28 * scale)}px`;
+        header.appendChild(titleEl);
+      }
+      if (opts.channel) {
+        const channelEl = document.createElement("div");
+        channelEl.className = "page-channel";
+        channelEl.textContent = opts.channel;
+        channelEl.style.fontSize = `${Math.round(titleSize * 0.4375)}px`;
+        header.appendChild(channelEl);
+      }
+      if (opts.url) {
+        const urlEl = document.createElement("div");
+        urlEl.className = "page-url";
+        urlEl.textContent = opts.url;
+        urlEl.style.fontSize = `${Math.round(titleSize * 0.25)}px`;
+        header.appendChild(urlEl);
+      }
+      pageEl.appendChild(header);
+    }
+
+    page.items.forEach((item) => {
+      pageEl.appendChild(buildImage(item, scale));
+    });
+
+    const footer = document.createElement("div");
+    footer.className = "page-footer";
+    footer.style.position = "absolute";
+    footer.style.bottom = "0";
+    footer.style.left = "0";
+    footer.style.right = "0";
+    footer.style.height = `${Math.round(FOOTER_H * scale)}px`;
+    footer.textContent = `${pageIndex + 1} / ${total}`;
+    pageEl.appendChild(footer);
+
+    els.pageList.appendChild(pageEl);
+  });
+
+  state.images.forEach((m) => { m.flash = false; });
+}
+
+function hideImage(index) {
+  const m = state.images[index];
+  if (!m) return;
+  m.hidden = true;
+  renderPages();
+  showToast("已隐藏图片，点击相邻图片的插入按钮恢复", "success");
+}
+
+function cloneImage(index) {
+  const m = state.images[index];
+  if (!m) return;
+  // 深拷贝一份，连同裁剪状态一起克隆，放在原图下方。
+  const copy = {
+    ...m,
+    crop: m.crop ? { ...m.crop } : { l: 0, t: 0, r: 1, b: 1 },
+    hidden: false,
+    flash: true,
+  };
+  state.images.splice(index + 1, 0, copy);
+  renderPages();
+  showToast("已克隆图片到下方", "success");
+}
+
+async function insertImages(index, side) {
+  if (state.inserting) return;
+  const list = state.images;
+
+  // 点击插入时若有隐藏图片，先全部恢复，不重新采样。
+  const hasHidden = list.some((m) => m.hidden);
+  if (hasHidden) {
+    list.forEach((m) => {
+      if (m.hidden) {
+        m.hidden = false;
+        m.flash = true;
       }
     });
+    showToast("已恢复隐藏的图片", "success");
+    renderPages();
+    return;
   }
-  updateAllCrops();
-  frame.setPointerCapture?.(event.pointerId);
+
+  const m = list[index];
+  if (!m) return;
+
+  let insertIndex;
+  let tStart;
+  let tEnd;
+  if (side === "above") {
+    const prev = list[index - 1];
+    if (!prev) {
+      showToast("已经是第一张图片，无法在上方插入");
+      return;
+    }
+    insertIndex = index;
+    tStart = prev.t;
+    tEnd = m.t;
+  } else {
+    const next = list[index + 1];
+    if (!next) {
+      showToast("已经是最后一张图片，无法在下方插入");
+      return;
+    }
+    insertIndex = index + 1;
+    tStart = m.t;
+    tEnd = next.t;
+  }
+
+  if (!(tEnd > tStart)) {
+    showToast("未发现遗漏内容");
+    return;
+  }
+
+  state.inserting = true;
+  showToast("正在插入...");
+  try {
+    const data = await fetchJson("/api/insert_captures", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        job_id: state.captureJobId,
+        t_start: tStart,
+        t_end: tEnd,
+        index: insertIndex,
+      }),
+    });
+    const inserted = data.captures || [];
+    if (!inserted.length) {
+      showToast("未发现遗漏内容");
+      return;
+    }
+    const normalized = inserted.map((c) => ({
+      file: c.file,
+      url: c.url,
+      t: c.t ?? 0,
+      w: c.w,
+      h: c.h,
+      hidden: false,
+      flash: true,
+      crop: { l: 0, t: 0, r: 1, b: 1 },
+    }));
+    list.splice(insertIndex, 0, ...normalized);
+    showToast(`已插入 ${inserted.length} 张图片`, "success");
+    renderPages();
+  } catch (error) {
+    showToast(error.message, "error");
+  } finally {
+    state.inserting = false;
+  }
 }
 
 async function pollJob(jobId) {
@@ -773,14 +1220,11 @@ async function generateCaptures() {
 }
 
 async function generatePdf() {
-  const images = state.captures.map((cap) => ({
-    file: cap.file,
-    keep: cap.keep,
-    left: cap.left,
-    right: cap.right,
-  }));
+  const images = state.images
+    .filter((m) => !m.hidden)
+    .map((m) => ({ file: m.file, crop: m.crop || { l: 0, t: 0, r: 1, b: 1 } }));
 
-  if (!images.some((item) => item.keep)) {
+  if (!images.length) {
     setStatus(els.adjustStatus, "请至少保留一张截图。", "error");
     return;
   }
@@ -800,6 +1244,7 @@ async function generatePdf() {
         margin: numericValue(els.pageMargin, 40),
         spacing: numericValue(els.imageSpacing, 25),
         orientation: currentOrientation(),
+        align: currentAlign(),
         bg_color: els.bgColor.value || "#ffffff",
         text_color: els.textColor.value || "#181818",
         note_dark: currentNoteDark(),
@@ -816,8 +1261,8 @@ async function generatePdf() {
     els.resultPdfDownload.href = data.pdf_url;
     els.resultPdfDownload.download = data.pdf_name || "tablatura.pdf";
     els.resultPdfFrame.src = data.pdf_url;
-    const kept = images.filter((item) => item.keep).length;
-    els.doneMeta.textContent = `共 ${data.page_count} 页，包含 ${kept} 张乐谱截图。`;
+    const kept = images.length;
+    els.doneMeta.textContent = `共 ${data.page_count} 页，包含 ${kept} 张截图。`;
     setStatus(els.adjustStatus, "PDF 已生成。", "success");
     setStage(4);
   } catch (error) {
@@ -1013,10 +1458,49 @@ els.bilibiliLoginButton.addEventListener("click", async () => {
 
 els.cropTop.addEventListener("pointerdown", (event) => beginDrag("top", event));
 els.cropBottom.addEventListener("pointerdown", (event) => beginDrag("bottom", event));
+els.cropLeft.addEventListener("pointerdown", (event) => beginDrag("left", event));
+els.cropRight.addEventListener("pointerdown", (event) => beginDrag("right", event));
 els.previewFrame.addEventListener("pointerdown", clickCrop);
 window.addEventListener("pointermove", dragCrop);
 window.addEventListener("pointerup", endDrag);
 window.addEventListener("pointercancel", endDrag);
+
+// 预览框随视频真实比例变化：横屏宽度顶满容器，竖屏按高度限制。
+let previewNaturalW = 0;
+let previewNaturalH = 0;
+
+function fitPreviewFrame() {
+  if (!previewNaturalW || !previewNaturalH) return;
+  const parent = els.previewFrame.parentElement;
+  const cs = getComputedStyle(parent);
+  // 父容器内容区宽度（去掉 padding，避免边框/padding 导致溢出）。
+  const containerW = parent.clientWidth - parseFloat(cs.paddingLeft) - parseFloat(cs.paddingRight);
+  const maxH = Math.min(720, Math.round(window.innerHeight * 0.75));
+  const ratio = previewNaturalW / previewNaturalH;
+  let frameW, frameH;
+  if (ratio >= 1) {
+    // 横屏/方屏：宽度顶满容器，高度按比例。
+    frameW = containerW;
+    frameH = Math.round(containerW / ratio);
+  } else {
+    // 竖屏：按高度限制，宽度随之缩小并居中。
+    frameH = maxH;
+    frameW = Math.round(maxH * ratio);
+  }
+  els.previewFrame.style.width = `${frameW}px`;
+  els.previewFrame.style.height = `${frameH}px`;
+}
+
+els.previewImage.addEventListener("load", () => {
+  previewNaturalW = els.previewImage.naturalWidth;
+  previewNaturalH = els.previewImage.naturalHeight;
+  fitPreviewFrame();
+});
+
+// A4 预览里的图片裁剪框拖动：松开鼠标时应用裁剪。
+window.addEventListener("pointermove", dragImageCrop);
+window.addEventListener("pointerup", endImageCropDrag);
+window.addEventListener("pointercancel", endImageCropDrag);
 
 els.timeline.addEventListener("pointerdown", beginTimelineTrackDrag);
 els.timelineStartHandle.addEventListener("pointerdown", (event) => beginTimelineDrag("start", event));
@@ -1026,8 +1510,23 @@ window.addEventListener("pointerup", endTimelineDrag);
 window.addEventListener("pointercancel", endTimelineDrag);
 
 els.generatePdfButton.addEventListener("click", generatePdf);
-els.binarizeInput.addEventListener("change", syncBinarizeOptions);
-els.binarizeAuto.addEventListener("change", syncThresholdControl);
+els.binarizeInput.addEventListener("change", () => {
+  syncBinarizeOptions();
+  renderPages();
+});
+els.binarizeAuto.addEventListener("change", () => {
+  syncThresholdControl();
+  renderPages();
+});
+els.invertInput.addEventListener("change", renderPages);
+document.querySelectorAll('input[name="noteDark"]').forEach((radio) => {
+  radio.addEventListener("change", renderPages);
+});
+let binarizePreviewTimer = null;
+els.binarizeThreshold.addEventListener("input", () => {
+  if (binarizePreviewTimer) clearTimeout(binarizePreviewTimer);
+  binarizePreviewTimer = setTimeout(renderPages, 120);
+});
 syncBinarizeOptions();
 els.backButton.addEventListener("click", () => {
   setStage(3);
@@ -1035,11 +1534,42 @@ els.backButton.addEventListener("click", () => {
 els.importNewButton.addEventListener("click", () => {
   setStage(1);
 });
-window.addEventListener("pointermove", dragHCrop);
-window.addEventListener("pointerup", endHCrop);
-window.addEventListener("pointercancel", endHCrop);
 
 els.generateButton.addEventListener("click", generateCaptures);
+
+// 先绑定颜色字段同步，再挂所见即所得监听，保证取色器/文本框变化顺序正确。
+bindColorField(els.bgColorHex, els.bgColor);
+bindColorField(els.textColorHex, els.textColor);
+
+// 所见即所得：标题/作者/配色/页边距/图间距/横竖向变化时实时重排预览。
+const layoutInputs = [
+  els.titleInput,
+  els.channelInput,
+  els.bgColor,
+  els.bgColorHex,
+  els.textColor,
+  els.textColorHex,
+  els.pageMargin,
+  els.imageSpacing,
+];
+layoutInputs.forEach((input) => {
+  if (input) input.addEventListener("input", renderPages);
+});
+document.querySelectorAll('input[name="orientation"]').forEach((radio) => {
+  radio.addEventListener("change", renderPages);
+});
+document.querySelectorAll('input[name="align"]').forEach((radio) => {
+  radio.addEventListener("change", renderPages);
+});
+
+// 窗口尺寸变化时重新填满容器（纸张保持 A4 比例）。
+let resizeTimer = null;
+window.addEventListener("resize", () => {
+  fitPreviewFrame();
+  if (state.stage !== 3) return;
+  if (resizeTimer) clearTimeout(resizeTimer);
+  resizeTimer = setTimeout(renderPages, 150);
+});
 
 const stepperList = document.querySelector(".stepper ol");
 stepperList.addEventListener("click", (event) => {
@@ -1060,9 +1590,6 @@ stepperList.addEventListener("keydown", (event) => {
     setStage(step);
   }
 });
-
-bindColorField(els.bgColorHex, els.bgColor);
-bindColorField(els.textColorHex, els.textColor);
 
 function updateBackToTop() {
   els.backToTop.classList.toggle("is-visible", window.scrollY > 400);

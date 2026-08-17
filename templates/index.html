@@ -69,9 +69,13 @@
           <div class="crop-overlay" id="cropOverlay">
             <div class="shade shade-top" id="shadeTop"></div>
             <div class="shade shade-bottom" id="shadeBottom"></div>
+            <div class="shade shade-left" id="shadeLeft"></div>
+            <div class="shade shade-right" id="shadeRight"></div>
             <div class="crop-window" id="cropWindow"></div>
             <button class="crop-handle crop-top" id="cropTop" type="button" aria-label="向上移动裁剪上边界"></button>
             <button class="crop-handle crop-bottom" id="cropBottom" type="button" aria-label="向下移动裁剪下边界"></button>
+            <button class="crop-handle crop-left" id="cropLeft" type="button" aria-label="向左移动裁剪左边界"></button>
+            <button class="crop-handle crop-right" id="cropRight" type="button" aria-label="向右移动裁剪右边界"></button>
           </div>
           <div class="preview-loading-overlay hidden" id="previewLoadingOverlay" role="status" aria-live="polite">
             <span class="spinner" aria-hidden="true"></span>
@@ -118,19 +122,19 @@
           <summary>高级设置</summary>
           <div class="form-grid advanced-grid">
             <label class="field">
-              <span>采样间隔</span>
+              <span>采样间隔 <span class="help-tip" data-tip="每隔多少秒截一帧画面。数值越小越不容易漏小节，但截图更多、处理更慢。" tabindex="0" role="button" aria-label="采样间隔说明">?</span></span>
               <input id="sampleEvery" type="number" min="0.5" step="0.5" value="2" autocomplete="off">
             </label>
             <label class="field">
-              <span>差异阈值</span>
+              <span>差异阈值 <span class="help-tip" data-tip="判定两帧是否同一画面的差异比例上限。超过该比例视为新画面保留，越低越敏感、截图越多。" tabindex="0" role="button" aria-label="差异阈值说明">?</span></span>
               <input id="diffThreshold" type="number" min="0" max="1" step="0.001" value="0.010" autocomplete="off">
             </label>
             <label class="field">
-              <span>频带半宽</span>
+              <span>条带半宽 <span class="help-tip" data-tip="播放头竖条左右各忽略的像素宽度。用于去掉移动的播放头，避免干扰去重。" tabindex="0" role="button" aria-label="条带半宽说明">?</span></span>
               <input id="bandHalfWidth" type="number" min="1" step="1" value="90" autocomplete="off">
             </label>
             <label class="field">
-              <span>比较窗口</span>
+              <span>比较窗口 <span class="help-tip" data-tip="与最近几张已保留截图比较来判重。窗口越大越能识别缓慢变化的画面，但更慢。" tabindex="0" role="button" aria-label="比较窗口说明">?</span></span>
               <input id="compareWindow" type="number" min="1" step="1" value="1" autocomplete="off">
             </label>
           </div>
@@ -184,7 +188,7 @@
             <input id="pageMargin" type="number" min="0" step="1" value="40" autocomplete="off">
           </label>
           <label class="field">
-            <span>图间距</span>
+            <span>行间距</span>
             <input id="imageSpacing" type="number" min="0" step="1" value="25" autocomplete="off">
           </label>
         </div>
@@ -195,10 +199,10 @@
               <label><input type="radio" name="orientation" value="portrait" checked autocomplete="off"><span>竖向纸张</span></label>
               <label><input type="radio" name="orientation" value="landscape" autocomplete="off"><span>横向纸张</span></label>
             </div>
-            <label class="toggle">
-              <input id="batchCrop" type="checkbox" autocomplete="off">
-              <span>批量裁剪</span>
-            </label>
+            <div class="align-toggle">
+              <label><input type="radio" name="align" value="center" checked autocomplete="off"><span>居中对齐</span></label>
+              <label><input type="radio" name="align" value="left" autocomplete="off"><span>居左对齐</span></label>
+            </div>
             <label class="toggle">
               <input id="binarizeInput" type="checkbox" autocomplete="off">
               <span>去除彩色背景</span>
@@ -234,7 +238,7 @@
         <button class="primary-button full-width" id="generatePdfButton" type="button">生成 PDF</button>
         <span class="status-line adjust-status" id="adjustStatus"></span>
         
-        <div class="capture-grid" id="captureGrid"></div>
+        <div class="page-list" id="pageList"></div>
       </section>
 
       <section class="panel done-panel hidden" id="donePanel">

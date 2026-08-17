@@ -65,7 +65,9 @@ class VideoMetadata:
 class ExtractionOptions:
     sample_every_sec: float = 2.0
     crop_y_start_ratio: float = 0.0
-    crop_y_end_ratio: float = 0.46
+    crop_y_end_ratio: float = 1.0
+    crop_x_start_ratio: float = 0.0
+    crop_x_end_ratio: float = 1.0
     hash_threshold: int = 16
     hash_size: int = 12
     diff_threshold: float = 0.010
@@ -383,28 +385,6 @@ def download_bilibili_video(
         raise FileNotFoundError("bilix 已结束，但未找到视频文件。")
 
     return video_path
-
-
-def dhash(image: Image.Image, hash_size: int = 12) -> int:
-    """
-    Difference hash para detectar imágenes similares.
-    hash_size=12 da un hash de 144 bits, más estable que el clásico 8x8.
-    """
-    gray = ImageOps.grayscale(image)
-    resized = gray.resize((hash_size + 1, hash_size), RESAMPLE)
-    pixels = np.array(resized)
-
-    diff = pixels[:, 1:] > pixels[:, :-1]
-
-    h = 0
-    for bit in diff.flatten():
-        h = (h << 1) | int(bit)
-
-    return h
-
-
-def hamming_distance(a: int, b: int) -> int:
-    return (a ^ b).bit_count()
 
 
 def is_mostly_dark_or_blank(image: Image.Image, std_threshold: float = 8.0) -> bool:
@@ -779,18 +759,34 @@ def validate_crop_ratios(crop_y_start_ratio: float, crop_y_end_ratio: float) -> 
         raise ValueError("垂直裁剪至少需要覆盖视频的 5%。")
 
 
+def validate_crop_x_ratios(crop_x_start_ratio: float, crop_x_end_ratio: float) -> None:
+    if not 0.0 <= crop_x_start_ratio < crop_x_end_ratio <= 1.0:
+        raise ValueError(
+            "裁剪范围必须满足 0 <= crop_x_start < crop_x_end <= 1。"
+        )
+    if crop_x_end_ratio - crop_x_start_ratio < 0.01:
+        raise ValueError("水平裁剪至少需要覆盖视频的 1%。")
+
+
 def crop_frame_rgb(
     frame_rgb: np.ndarray,
     crop_y_start_ratio: float,
     crop_y_end_ratio: float,
+    crop_x_start_ratio: float = 0.0,
+    crop_x_end_ratio: float = 1.0,
 ) -> np.ndarray:
     validate_crop_ratios(crop_y_start_ratio, crop_y_end_ratio)
-    h, _w, _ = frame_rgb.shape
+    validate_crop_x_ratios(crop_x_start_ratio, crop_x_end_ratio)
+    h, w, _ = frame_rgb.shape
     y1 = int(round(h * crop_y_start_ratio))
     y2 = int(round(h * crop_y_end_ratio))
     y1 = max(0, min(h - 1, y1))
     y2 = max(y1 + 1, min(h, y2))
-    return frame_rgb[y1:y2, :, :]
+    x1 = int(round(w * crop_x_start_ratio))
+    x2 = int(round(w * crop_x_end_ratio))
+    x1 = max(0, min(w - 1, x1))
+    x2 = max(x1 + 1, min(w, x2))
+    return frame_rgb[y1:y2, x1:x2, :]
 
 
 def save_video_frame(
@@ -838,9 +834,11 @@ def extract_unique_crops(
     crops_dir: Path,
     comparison_dir: Optional[Path] = None,
     sample_every_sec: float = 2.0,
-    crop_top_ratio: Optional[float] = 0.46,
+    crop_top_ratio: Optional[float] = 1.0,
     crop_y_start_ratio: Optional[float] = None,
     crop_y_end_ratio: Optional[float] = None,
+    crop_x_start_ratio: float = 0.0,
+    crop_x_end_ratio: float = 1.0,
     hash_threshold: int = 16,
     hash_size: int = 12,
     diff_threshold: float = 0.010,
@@ -862,8 +860,9 @@ def extract_unique_crops(
     if crop_y_start_ratio is None:
         crop_y_start_ratio = 0.0
     if crop_y_end_ratio is None:
-        crop_y_end_ratio = crop_top_ratio if crop_top_ratio is not None else 0.46
+        crop_y_end_ratio = crop_top_ratio if crop_top_ratio is not None else 1.0
     validate_crop_ratios(crop_y_start_ratio, crop_y_end_ratio)
+    validate_crop_x_ratios(crop_x_start_ratio, crop_x_end_ratio)
 
     cap = cv2.VideoCapture(str(video_path))
     if not cap.isOpened():
@@ -888,6 +887,7 @@ def extract_unique_crops(
         end_sec=end_sec,
     )
     recent_kept: List[ComparisonFrame] = []
+    saved_times: Dict[str, float] = {}
     compare_window = max(1, compare_window)
 
     print(f"检测到时长：{duration:.2f}s")
@@ -913,7 +913,13 @@ def extract_unique_crops(
         stats.frames_checked += 1
 
         frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        cropped = crop_frame_rgb(frame_rgb, crop_y_start_ratio, crop_y_end_ratio)
+        cropped = crop_frame_rgb(
+            frame_rgb,
+            crop_y_start_ratio,
+            crop_y_end_ratio,
+            crop_x_start_ratio,
+            crop_x_end_ratio,
+        )
 
         original_img = Image.fromarray(cropped)
 
@@ -985,6 +991,7 @@ def extract_unique_crops(
             save_image = original_img
 
         save_image.convert("RGB").save(output_path)
+        saved_times[output_path.name] = float(current_time)
 
         if comparison_dir is not None:
             save_debug_images(
@@ -1030,6 +1037,13 @@ def extract_unique_crops(
     print(f"最终截图：{stats.captures_kept}")
     if progress_callback is not None:
         progress_callback("finished", stats)
+
+    times_path = crops_dir / "times.json"
+    try:
+        with times_path.open("w", encoding="utf-8") as fh:
+            json.dump(saved_times, fh, ensure_ascii=False)
+    except OSError:
+        pass
 
     return stats
 
@@ -1247,10 +1261,15 @@ def build_pdf_from_images(
     spacing: int = 25,
     bg_color: str = "white",
     text_color: str = "181818",
+    align: str = "left",
+    fit_width: bool = True,
 ):
     """
-    Crea un PDF con varias capturas por página, una debajo de la otra.
+    每张图片独占一行、自上而下堆叠生成 PDF。
     第一页顶部是标题/作者/原链接页头，之后每页底部都有页码。
+    spacing 为相邻两图（行）之间的垂直间距；align 为水平对齐（left/center）。
+    当 fit_width=True 时把每张图缩放到内容区宽度（CLI 直接使用原始截图）；
+    传 False 表示图片已按基准缩放裁切好，只做水平对齐、不再缩放。
     """
     image_paths = sorted(images_dir.glob("*.png"))
     if not image_paths:
@@ -1260,6 +1279,8 @@ def build_pdf_from_images(
 
     if orientation == "landscape":
         page_width, page_height = page_height, page_width
+
+    content_w = page_width - 2 * margin
 
     pages = []
     page = Image.new("RGB", (page_width, page_height), bg_color)
@@ -1271,21 +1292,26 @@ def build_pdf_from_images(
 
     for img_path in image_paths:
         img = Image.open(img_path).convert("RGB")
+        w, h = img.size
+        if fit_width:
+            # 每张图统一缩放到内容区宽度（与前端预览一致）。
+            ratio = content_w / w
+            w = content_w
+            h = int(round(h * ratio))
+            img = img.resize((w, h), RESAMPLE)
 
-        max_w = page_width - 2 * margin
-        ratio = max_w / img.width
-        new_w = int(img.width * ratio)
-        new_h = int(img.height * ratio)
+        x = margin
+        if align == "center":
+            x = margin + (content_w - w) // 2
 
-        img = img.resize((new_w, new_h), RESAMPLE)
-
-        if current_y + new_h + margin + footer_height > page_height:
+        # 翻页：本图放不下时另起一页
+        if current_y + h + margin + footer_height > page_height:
             pages.append(page)
             page = Image.new("RGB", (page_width, page_height), bg_color)
             current_y = margin
 
-        page.paste(img, (margin, current_y))
-        current_y += new_h + spacing
+        page.paste(img, (x, current_y))
+        current_y += h + spacing
 
     pages.append(page)
 
@@ -1352,8 +1378,8 @@ def main():
     parser.add_argument(
         "--crop-top-ratio",
         type=float,
-        default=0.46,
-        help="Compatibilidad: porcentaje superior a recortar (default: 0.46)",
+        default=1.0,
+        help="Compatibilidad: porcentaje superior a recortar (default: 1.0).",
     )
 
     parser.add_argument(
@@ -1368,6 +1394,20 @@ def main():
         type=float,
         default=None,
         help="Final vertical del recorte, de 0.0 a 1.0. Útil para tabs abajo.",
+    )
+
+    parser.add_argument(
+        "--crop-x-start",
+        type=float,
+        default=None,
+        help="Inicio horizontal del recorte, de 0.0 a 1.0 (default: 0.0).",
+    )
+
+    parser.add_argument(
+        "--crop-x-end",
+        type=float,
+        default=None,
+        help="Final horizontal del recorte, de 0.0 a 1.0 (default: 1.0).",
     )
 
     parser.add_argument(
@@ -1474,6 +1514,13 @@ def main():
     except ValueError as exc:
         parser.error(str(exc))
 
+    crop_x_start = args.crop_x_start if args.crop_x_start is not None else 0.0
+    crop_x_end = args.crop_x_end if args.crop_x_end is not None else 1.0
+    try:
+        validate_crop_x_ratios(crop_x_start, crop_x_end)
+    except ValueError as exc:
+        parser.error(str(exc))
+
     source = args.source
     output_pdf = Path(args.output).resolve()
 
@@ -1528,6 +1575,8 @@ def main():
             sample_every_sec=args.sample_every,
             crop_y_start_ratio=crop_y_start,
             crop_y_end_ratio=crop_y_end,
+            crop_x_start_ratio=crop_x_start,
+            crop_x_end_ratio=crop_x_end,
             hash_threshold=args.hash_threshold,
             hash_size=args.hash_size,
             diff_threshold=args.diff_threshold,
@@ -1548,6 +1597,8 @@ def main():
             sample_every_sec=options.sample_every_sec,
             crop_y_start_ratio=options.crop_y_start_ratio,
             crop_y_end_ratio=options.crop_y_end_ratio,
+            crop_x_start_ratio=options.crop_x_start_ratio,
+            crop_x_end_ratio=options.crop_x_end_ratio,
             hash_threshold=options.hash_threshold,
             hash_size=options.hash_size,
             diff_threshold=options.diff_threshold,
