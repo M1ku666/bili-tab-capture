@@ -1,5 +1,6 @@
 .DS_Store
 cookie.txt
+todo.txt
 
 # Python
 __pycache__/
@@ -14,7 +15,7 @@ env/
 capturas_tablatura/
 debug_comparacion_tablatura/
 video_cache/
-app_cache/
+BiliTabCaptrue_cache/
 
 # Local/editor files
 .idea/

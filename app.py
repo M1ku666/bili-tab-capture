@@ -10,9 +10,9 @@ import uuid
 import os
 import webbrowser
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
-from runtime_paths import data_dir
+from runtime_paths import data_dir, resource_dir
 from flask import Flask, jsonify, render_template, request, send_file, send_from_directory
 from werkzeug.utils import secure_filename
 from PIL import Image, ImageColor, ImageOps
@@ -23,32 +23,57 @@ from tab_extractor import (
     ExtractionStats,
     RESAMPLE,
     VideoMetadata,
-    binarize_luminance,
+    build_long_image,
     build_pdf_from_images,
     build_video_metadata,
+    compute_stitch_seams,
     decode_bytes,
+    detect_measure_barlines,
     download_bilibili_video,
     download_video,
+    extract_note_mask,
     extract_unique_crops,
     find_video_file,
     get_video_duration,
     hex_to_rgb,
     normalize_bilibili_url,
+    preprocess_for_detection,
     probe_bilibili_metadata,
     probe_youtube_metadata,
+    recolor_gray,
     save_video_frame,
+    split_into_measures,
     validate_crop_ratios,
     validate_crop_x_ratios,
 )
 
 
 ROOT_DIR = data_dir()
-CACHE_DIR = ROOT_DIR / "app_cache"
+CACHE_DIR = ROOT_DIR / "BiliTabCaptrue_cache"
 UPLOADS_DIR = CACHE_DIR / "uploads"
 PREVIEWS_DIR = CACHE_DIR / "previews"
 RUNS_DIR = CACHE_DIR / "runs"
+
+
+def current_version() -> str:
+    """从本地 VERSION 文件读取当前版本号（打包时该文件会随资源一并打包）。"""
+    candidates = [resource_dir() / "VERSION", ROOT_DIR / "VERSION", Path(__file__).resolve().parent / "VERSION"]
+    for p in candidates:
+        try:
+            text = p.read_text(encoding="utf-8").strip()
+            if text:
+                return text
+        except OSError:
+            continue
+    return "0.0"
+
+
+APP_VERSION = current_version()
+
 ALLOWED_VIDEO_EXTENSIONS = {".mp4", ".mov", ".mkv", ".webm"}
+ALLOWED_IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".gif"}
 YOUTUBE_PREVIEW_MAX_HEIGHT = 480
+MIN_SPLIT_PX = 30  # 横向分割后每段的最小绝对像素高度（与前端保持一致）
 
 app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = 2 * 1024 * 1024 * 1024
@@ -120,6 +145,7 @@ def run_bilibili_login_worker(token: str) -> None:
 
 
 def ensure_cache_dirs() -> None:
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)
     for directory in (UPLOADS_DIR, PREVIEWS_DIR, RUNS_DIR):
         directory.mkdir(parents=True, exist_ok=True)
 
@@ -180,6 +206,16 @@ def parse_hex_color(value: Any, default: str = "#181818") -> str:
     return default
 
 
+def parse_optional_note_color(value: Any) -> Optional[Tuple[int, int, int]]:
+    """解析音符颜色；为空或非法时返回 None（表示不按音符颜色二值化）。"""
+    value = (value or "").strip()
+    if re.fullmatch(r"#[0-9a-fA-F]{6}", value):
+        return hex_to_rgb(value)
+    if re.fullmatch(r"[0-9a-fA-F]{6}", value):
+        return hex_to_rgb("#" + value)
+    return None
+
+
 def append_job_log(job_id: str, text: str) -> None:
     text = text.replace("\r", "\n")
     lines = [line.strip() for line in text.splitlines() if line.strip()]
@@ -230,14 +266,21 @@ def source_or_error(source_id: str) -> Dict[str, Any]:
 _INVALID_FILENAME_CHARS = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
 
 
-def safe_pdf_name(value: str) -> str:
+def safe_output_name(value: str, ext: str) -> str:
     # 保留中文等 Unicode，只替换 Windows 文件名不允许的字符。
     filename = _INVALID_FILENAME_CHARS.sub("_", (value or "tablatura.pdf").strip()).strip(" .")
+    # 只去掉结尾的 .pdf/.png 扩展名（保留标题中其它位置的「.」）。
+    for existing in (".pdf", ".png"):
+        if filename.lower().endswith(existing):
+            filename = filename[: -len(existing)]
+            break
     if not filename:
-        filename = "tablatura.pdf"
-    if not filename.lower().endswith(".pdf"):
-        filename += ".pdf"
-    return filename
+        filename = "tablatura"
+    return filename + ext
+
+
+def safe_pdf_name(value: str) -> str:
+    return safe_output_name(value, ".pdf")
 
 
 def cached_remote_preview_video(source: Dict[str, Any]) -> Path:
@@ -436,9 +479,95 @@ def run_capture_job(job_id: str, payload: Dict[str, Any]) -> None:
             print(f"错误：{exc}")
 
 
+def start_image_capture(source: Dict[str, Any], payload: Dict[str, Any]):
+    """图片源不走视频提取，直接按裁剪参数切一张截图、立即产出任务。"""
+    crop_y_start = parse_float(payload.get("crop_y_start"), "crop_y_start", 0.0)
+    crop_y_end = parse_float(payload.get("crop_y_end"), "crop_y_end", 1)
+    crop_x_start = parse_float(payload.get("crop_x_start"), "crop_x_start", 0.0)
+    crop_x_end = parse_float(payload.get("crop_x_end"), "crop_x_end", 1.0)
+    validate_crop_ratios(crop_y_start, crop_y_end)
+    validate_crop_x_ratios(crop_x_start, crop_x_end)
+
+    job_id = uuid.uuid4().hex
+    run_dir = RUNS_DIR / job_id
+    crops_dir = run_dir / "crops"
+    crops_dir.mkdir(parents=True, exist_ok=True)
+
+    metadata = metadata_from_dict(source.get("metadata", {}))
+    image = Image.open(source["path"]).convert("RGB")
+    w, h = image.size
+    box = (
+        int(round(w * crop_x_start)),
+        int(round(h * crop_y_start)),
+        int(round(w * crop_x_end)),
+        int(round(h * crop_y_end)),
+    )
+    image = image.crop(box)
+    out_name = "crop_0000_t00000.png"
+    image.save(crops_dir / out_name)
+    nw, nh = image.size
+    capture = {
+        "file": out_name,
+        "url": f"/api/captures/{job_id}/{out_name}",
+        "t": 0.0,
+        "w": nw,
+        "h": nh,
+    }
+    stats = ExtractionStats(captures_kept=1).to_dict()
+    with STORE_LOCK:
+        JOBS[job_id] = {
+            "id": job_id,
+            "source_id": source["id"],
+            "status": "done",
+            "phase": "done",
+            "logs": ["已导入图片。"],
+            "stats": stats,
+            "captures": [capture],
+            "metadata": metadata_to_dict(metadata),
+            "error": None,
+            "pdf_url": None,
+            "created_at": time.time(),
+            "updated_at": time.time(),
+        }
+    return jsonify({"job_id": job_id})
+
+
 @app.route("/")
 def index():
-    return render_template("index.html")
+    return render_template("index.html", app_version=APP_VERSION)
+
+
+@app.get("/api/version")
+def api_version():
+    return jsonify({"version": APP_VERSION})
+
+
+SKIPPED_VERSION_FILE = CACHE_DIR / "skipped_version.txt"
+
+
+@app.get("/api/skipped_version")
+def api_skipped_version():
+    value = ""
+    try:
+        value = SKIPPED_VERSION_FILE.read_text(encoding="utf-8").strip()
+    except OSError:
+        pass
+    return jsonify({"skipped_version": value})
+
+
+@app.post("/api/skipped_version")
+def api_set_skipped_version():
+    data = request.get_json(silent=True) or {}
+    value = str(data.get("version") or "").strip()
+    try:
+        ensure_cache_dirs()
+        if value:
+            SKIPPED_VERSION_FILE.write_text(value, encoding="utf-8")
+        else:
+            SKIPPED_VERSION_FILE.unlink(missing_ok=True)
+    except OSError:
+        pass
+    return jsonify({"ok": True})
 
 
 @app.post("/api/import")
@@ -475,24 +604,34 @@ def import_source():
         elif upload and upload.filename:
             original_name = secure_filename(upload.filename)
             suffix = Path(original_name).suffix.lower()
-            if suffix not in ALLOWED_VIDEO_EXTENSIONS:
-                return json_error("不支持的视频格式，请使用 mp4、mov、mkv 或 webm。")
             source_id = uuid.uuid4().hex
             upload_dir = UPLOADS_DIR / source_id
             upload_dir.mkdir(parents=True, exist_ok=True)
-            video_path = upload_dir / original_name
-            upload.save(video_path)
-            duration = get_video_duration(video_path)
-            metadata = build_video_metadata(raw_title=Path(original_name).stem)
-            source = {
-                "id": source_id,
-                "type": "local",
-                "path": str(video_path),
-                "metadata": metadata_to_dict(metadata),
-                "duration": duration,
-            }
+            saved_path = upload_dir / original_name
+            upload.save(saved_path)
+            if suffix in ALLOWED_IMAGE_EXTENSIONS:
+                metadata = build_video_metadata(raw_title=Path(original_name).stem)
+                source = {
+                    "id": source_id,
+                    "type": "image",
+                    "path": str(saved_path),
+                    "metadata": metadata_to_dict(metadata),
+                    "duration": None,
+                }
+            elif suffix in ALLOWED_VIDEO_EXTENSIONS:
+                duration = get_video_duration(saved_path)
+                metadata = build_video_metadata(raw_title=Path(original_name).stem)
+                source = {
+                    "id": source_id,
+                    "type": "local",
+                    "path": str(saved_path),
+                    "metadata": metadata_to_dict(metadata),
+                    "duration": duration,
+                }
+            else:
+                return json_error("不支持的文件格式，请使用视频（mp4/mov/mkv/webm）或图片（png/jpg/webp/bmp/gif）。")
         else:
-            return json_error("请填写 YouTube 链接或 Bilibili BV 号，或选择本地视频。")
+            return json_error("请填写 BV 号，或选择本地视频。")
 
         with STORE_LOCK:
             SOURCES[source_id] = source
@@ -592,7 +731,9 @@ def start_captures():
     ensure_cache_dirs()
     payload = request.get_json(force=True, silent=True) or {}
     try:
-        source_or_error(payload.get("source_id"))
+        source = source_or_error(payload.get("source_id"))
+        if source["type"] == "image":
+            return start_image_capture(source, payload)
         start_sec = parse_float(payload.get("start"), "start", 0.0)
         end_sec = parse_optional_float(payload.get("end"), "end")
         if start_sec < 0:
@@ -639,9 +780,9 @@ def capture_file(job_id: str, filename: str):
 
 @app.get("/api/capture_preview/<job_id>/<path:filename>")
 def capture_preview(job_id: str, filename: str):
-    """按当前二值化/反色/配色设置实时返回处理后的单张截图。
+    """按当前去色/反色/配色设置实时返回处理后的单张截图。
 
-    变换顺序与 /api/pdf 完全一致（先反色，再二值化），保证预览所见即所得。
+    流程：原图 → (可选)按音符颜色二值化 → (可选)染色为文字/背景色 → (可选)反色。
     """
     crops_dir = RUNS_DIR / job_id / "crops"
     src = crops_dir / filename
@@ -650,15 +791,11 @@ def capture_preview(job_id: str, filename: str):
 
     invert = parse_bool(request.args.get("invert"))
     binarize = parse_bool(request.args.get("binarize"))
-    note_dark = parse_bool(request.args.get("note_dark", "true"))
+    recolor = parse_bool(request.args.get("recolor"))
 
-    threshold_raw = request.args.get("threshold")
-    threshold = None
-    if threshold_raw not in (None, ""):
-        try:
-            threshold = int(float(threshold_raw))
-        except (TypeError, ValueError):
-            threshold = None
+    note_rgb = parse_optional_note_color(request.args.get("note_color"))
+    tolerance = parse_float(request.args.get("tolerance"), "tolerance", 60.0)
+    softness = parse_float(request.args.get("softness"), "softness", 20.0)
 
     text_color = parse_hex_color(request.args.get("text_color"), "#181818")
     bg_color = (request.args.get("bg_color") or "white").strip()
@@ -667,25 +804,120 @@ def capture_preview(job_id: str, filename: str):
 
     try:
         img = Image.open(src).convert("RGB")
+        if binarize and note_rgb is not None:
+            mask = extract_note_mask(img, note_rgb, tolerance, softness)
+            if recolor:
+                img = recolor_gray(mask, hex_to_rgb(text_color), ImageColor.getrgb(bg_color))
+            else:
+                img = mask.convert("RGB")
         if invert:
             img = ImageOps.invert(img)
-        if binarize:
-            thr = threshold
-            if not note_dark and thr is not None:
-                thr = 255 - thr
-            img = binarize_luminance(
-                img,
-                threshold=thr,
-                dark_note=note_dark,
-                foreground_rgb=hex_to_rgb(text_color),
-                background_rgb=ImageColor.getrgb(bg_color),
-            )
         buf = io.BytesIO()
         img.save(buf, "PNG")
         buf.seek(0)
         return send_file(buf, mimetype="image/png")
     except Exception as exc:
         return json_error(str(exc), 500)
+
+
+def _parse_layout_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
+    margin = int(parse_float(payload.get("margin"), "margin", 40))
+    spacing = int(parse_float(payload.get("spacing"), "spacing", 25))
+    title_spacing = int(parse_float(payload.get("title_spacing"), "title_spacing", 130))
+    scale = parse_float(payload.get("scale"), "scale", 1.0)
+    scale = max(0.05, min(10.0, scale))
+    bg_color = (payload.get("bg_color") or "white").strip()
+    if not re.fullmatch(r"#[0-9a-fA-F]{6}|[a-zA-Z]+", bg_color):
+        bg_color = "white"
+    text_color = parse_hex_color(payload.get("text_color"), "#181818")
+    binarize = parse_bool(payload.get("binarize"))
+    invert = parse_bool(payload.get("invert"))
+    note_rgb = parse_optional_note_color(payload.get("note_color"))
+    tolerance = parse_float(payload.get("tolerance"), "tolerance", 60.0)
+    softness = parse_float(payload.get("softness"), "softness", 20.0)
+    orientation = payload.get("orientation") or "portrait"
+    if orientation not in ("portrait", "landscape"):
+        orientation = "portrait"
+    align = payload.get("align") or "left"
+    if align not in ("left", "center", "right"):
+        align = "left"
+    valign = payload.get("valign") or "top"
+    if valign not in ("top", "center", "bottom"):
+        valign = "top"
+    title = (payload.get("title") or "").strip()
+    title_lines = [ln for ln in title.splitlines() if ln.strip()]
+    return {
+        "margin": margin,
+        "spacing": spacing,
+        "title_spacing": title_spacing,
+        "scale": scale,
+        "bg_color": bg_color,
+        "text_color": text_color,
+        "binarize": binarize,
+        "invert": invert,
+        "note_rgb": note_rgb,
+        "tolerance": tolerance,
+        "softness": softness,
+        "orientation": orientation,
+        "align": align,
+        "valign": valign,
+        "title_lines": title_lines,
+    }
+
+
+def prepare_final_strips(
+    job_id: str, payload: Dict[str, Any], opts: Dict[str, Any]
+) -> tuple[Path, int]:
+    """把每张截图按小节线拆成竖条、缩放并二值化/反色，写到 final 目录。
+
+    返回 (final_dir, strip_count)。
+    """
+    crops_dir = RUNS_DIR / job_id / "crops"
+    final_dir = RUNS_DIR / job_id / "final"
+    final_dir.mkdir(parents=True, exist_ok=True)
+    for old in final_dir.glob("*.png"):
+        old.unlink()
+
+    scale = opts["scale"]
+    index = 0
+    for item in payload.get("images") or []:
+        src_path = crops_dir / item.get("file", "")
+        if not src_path.exists():
+            continue
+        img = Image.open(src_path).convert("RGB")
+        iw, ih = img.size
+        crop = item.get("crop") or {}
+        c_l = max(0.0, min(1.0, float(crop.get("l", 0.0))))
+        c_r = max(c_l, min(1.0, float(crop.get("r", 1.0))))
+        c_t = max(0.0, min(1.0, float(crop.get("t", 0.0))))
+        c_b = max(c_t, min(1.0, float(crop.get("b", 1.0))))
+        y0 = int(round(ih * c_t))
+        y1 = int(round(ih * c_b))
+        measures = [float(m) for m in (item.get("measures") or [])]
+        bounds = [c_l] + sorted(m for m in measures if c_l < m < c_r) + [c_r]
+        bounds = sorted(set(bounds))
+        for i in range(len(bounds) - 1):
+            x0 = int(round(iw * bounds[i]))
+            x1 = int(round(iw * bounds[i + 1]))
+            if x1 - x0 < 1:
+                continue
+            strip = img.crop((x0, y0, x1, y1))
+            if scale != 1.0:
+                nw = max(1, int(round(strip.width * scale)))
+                nh = max(1, int(round(strip.height * scale)))
+                strip = strip.resize((nw, nh), RESAMPLE)
+            if opts["binarize"] and opts["note_rgb"] is not None:
+                mask = extract_note_mask(strip, opts["note_rgb"], opts["tolerance"], opts["softness"])
+                strip = recolor_gray(
+                    mask,
+                    hex_to_rgb(opts["text_color"]),
+                    ImageColor.getrgb(opts["bg_color"]),
+                )
+            if opts["invert"]:
+                strip = ImageOps.invert(strip)
+            strip.save(final_dir / f"final_{index:04d}.png")
+            index += 1
+    return final_dir, index
 
 
 @app.post("/api/pdf")
@@ -701,97 +933,27 @@ def build_pdf():
 
         source = SOURCES.get(job.get("source_id"), {})
         source_metadata = metadata_from_dict(source.get("metadata", {}))
+        opts = _parse_layout_payload(payload)
 
-        crops_dir = RUNS_DIR / job_id / "crops"
-        final_dir = RUNS_DIR / job_id / "final"
-        final_dir.mkdir(parents=True, exist_ok=True)
-        for old in final_dir.glob("*.png"):
-            old.unlink()
-
-        margin = int(parse_float(payload.get("margin"), "margin", 40))
-        spacing = int(parse_float(payload.get("spacing"), "spacing", 25))
-        bg_color = (payload.get("bg_color") or "white").strip()
-        if not re.fullmatch(r"#[0-9a-fA-F]{6}|[a-zA-Z]+", bg_color):
-            bg_color = "white"
-
-        text_color = parse_hex_color(payload.get("text_color"), "#181818")
-        note_dark = parse_bool(payload.get("note_dark", True))
-        binarize = parse_bool(payload.get("binarize"))
-        invert = parse_bool(payload.get("invert"))
-        binarize_threshold = parse_optional_float(payload.get("binarize_threshold"), "binarize_threshold")
-        binarize_threshold = int(binarize_threshold) if binarize_threshold is not None else None
-        if not note_dark and binarize_threshold is not None:
-            binarize_threshold = 255 - binarize_threshold
-
-        orientation = payload.get("orientation") or "portrait"
-        if orientation not in ("portrait", "landscape"):
-            orientation = "portrait"
-        align = payload.get("align") or "left"
-        if align not in ("left", "center"):
-            align = "left"
-
-        # 与 build_pdf_from_images 一致：横向纸张交换宽高，据此算内容区宽度。
-        pdf_w, pdf_h = 1654, 2339
-        if orientation == "landscape":
-            pdf_w, pdf_h = pdf_h, pdf_w
-        content_w = pdf_w - 2 * margin
-
-        index = 0
-        for item in payload.get("images") or []:
-            src_path = crops_dir / item.get("file", "")
-            if not src_path.exists():
-                continue
-            img = Image.open(src_path).convert("RGB")
-            crop = item.get("crop") or {}
-            c_l = max(0.0, min(1.0, float(crop.get("l", 0.0))))
-            c_t = max(0.0, min(1.0, float(crop.get("t", 0.0))))
-            c_r = max(c_l, min(1.0, float(crop.get("r", 1.0))))
-            c_b = max(c_t, min(1.0, float(crop.get("b", 1.0))))
-            iw, ih = img.size
-            # 先按原图缩放到内容区宽度（基准缩放），再裁切，保证裁切后缩放不变化。
-            scaled_h = int(round(ih * (content_w / iw)))
-            img = img.resize((content_w, scaled_h), RESAMPLE)
-            img = img.crop((
-                int(round(content_w * c_l)),
-                int(round(scaled_h * c_t)),
-                int(round(content_w * c_r)),
-                int(round(scaled_h * c_b)),
-            ))
-            if invert:
-                img = ImageOps.invert(img)
-            if binarize:
-                img = binarize_luminance(
-                    img,
-                    threshold=binarize_threshold,
-                    dark_note=note_dark,
-                    foreground_rgb=hex_to_rgb(text_color),
-                    background_rgb=ImageColor.getrgb(bg_color),
-                )
-            img.save(final_dir / f"final_{index:04d}.png")
-            index += 1
-
+        final_dir, index = prepare_final_strips(job_id, payload, opts)
         if index == 0:
             return json_error("没有可导出的截图。")
 
-        metadata = build_video_metadata(
-            raw_title=source_metadata.raw_title,
-            channel=source_metadata.channel,
-            source_url=source_metadata.source_url,
-            title_override=payload.get("title"),
-            channel_override=payload.get("channel"),
-        )
         output_pdf = RUNS_DIR / job_id / safe_pdf_name(payload.get("output") or "tablatura.pdf")
         page_count = build_pdf_from_images(
             final_dir,
             output_pdf,
-            metadata=metadata,
-            margin=margin,
-            spacing=spacing,
-            bg_color=bg_color,
-            text_color=text_color,
-            orientation=orientation,
-            align=align,
-            fit_width=False,
+            margin=opts["margin"],
+            spacing=opts["spacing"],
+            bg_color=opts["bg_color"],
+            text_color=opts["text_color"],
+            orientation=opts["orientation"],
+            align=opts["align"],
+            valign=opts["valign"],
+            fit_width=True,
+            title_lines=opts["title_lines"],
+            title_spacing=opts["title_spacing"],
+            source_url=source_metadata.source_url,
         )
 
         update_job(job_id, pdf_name=output_pdf.name, pdf_url=f"/api/jobs/{job_id}/pdf")
@@ -800,6 +962,176 @@ def build_pdf():
             "pdf_name": output_pdf.name,
             "page_count": page_count,
         })
+    except Exception as exc:
+        return json_error(str(exc), 500)
+
+
+@app.post("/api/long_image")
+def build_long_image_route():
+    ensure_cache_dirs()
+    payload = request.get_json(force=True, silent=True) or {}
+    try:
+        job_id = payload.get("job_id")
+        with STORE_LOCK:
+            job = JOBS.get(job_id)
+        if job is None:
+            return json_error("未知的任务。", 404)
+
+        source = SOURCES.get(job.get("source_id"), {})
+        source_metadata = metadata_from_dict(source.get("metadata", {}))
+        opts = _parse_layout_payload(payload)
+
+        final_dir, index = prepare_final_strips(job_id, payload, opts)
+        if index == 0:
+            return json_error("没有可导出的截图。")
+
+        output_png = RUNS_DIR / job_id / safe_pdf_name(payload.get("output")).replace(".pdf", ".png")
+        build_long_image(
+            final_dir,
+            output_png,
+            page_width=1654,
+            margin=opts["margin"],
+            spacing=opts["spacing"],
+            bg_color=opts["bg_color"],
+            text_color=opts["text_color"],
+            align=opts["align"],
+            valign=opts["valign"],
+            fit_width=True,
+            title_lines=opts["title_lines"],
+            title_spacing=opts["title_spacing"],
+            source_url=source_metadata.source_url,
+        )
+        update_job(job_id, long_name=output_png.name)
+        return jsonify({
+            "long_url": f"/api/jobs/{job_id}/long_image",
+            "long_name": output_png.name,
+        })
+    except Exception as exc:
+        return json_error(str(exc), 500)
+
+
+@app.post("/api/detect_measures")
+def detect_measures():
+    ensure_cache_dirs()
+    payload = request.get_json(force=True, silent=True) or {}
+    try:
+        job_id = payload.get("job_id")
+        with STORE_LOCK:
+            job = JOBS.get(job_id)
+        if job is None:
+            return json_error("未知的任务。", 404)
+        crops_dir = RUNS_DIR / job_id / "crops"
+        files = payload.get("files") or []
+        coefficient_horizontal = parse_float(
+            payload.get("coefficient_horizontal"), "coefficient_horizontal", 0.7
+        )
+        coefficient_vertical = parse_float(
+            payload.get("coefficient_vertical"), "coefficient_vertical", 0.8
+        )
+        note_rgb = parse_optional_note_color(payload.get("note_color"))
+        tolerance = parse_float(payload.get("tolerance"), "tolerance", 60.0)
+        softness = parse_float(payload.get("softness"), "softness", 20.0)
+        results: Dict[str, List[float]] = {}
+        for name in files:
+            src = crops_dir / name
+            if not src.exists():
+                continue
+            img = Image.open(src).convert("RGB")
+            w = img.width
+            cleaned = preprocess_for_detection(img, note_rgb, tolerance, softness)
+            bars = detect_measure_barlines(
+                cleaned,
+                coefficient_horizontal=coefficient_horizontal,
+                coefficient_vertical=coefficient_vertical,
+            )
+            results[name] = [round(b / w, 5) for b in bars]
+        return jsonify({"measures": results})
+    except Exception as exc:
+        return json_error(str(exc), 500)
+
+
+@app.post("/api/stitch")
+def stitch_offsets():
+    ensure_cache_dirs()
+    payload = request.get_json(force=True, silent=True) or {}
+    try:
+        job_id = payload.get("job_id")
+        with STORE_LOCK:
+            job = JOBS.get(job_id)
+        if job is None:
+            return json_error("未知的任务。", 404)
+        crops_dir = RUNS_DIR / job_id / "crops"
+        files = payload.get("files") or []
+        coefficient_horizontal = parse_float(
+            payload.get("coefficient_horizontal"), "coefficient_horizontal", 0.7
+        )
+        coefficient_vertical = parse_float(
+            payload.get("coefficient_vertical"), "coefficient_vertical", 0.8
+        )
+        max_width = int(parse_float(payload.get("max_width"), "max_width", 600))
+        note_rgb = parse_optional_note_color(payload.get("note_color"))
+        tolerance = parse_float(payload.get("tolerance"), "tolerance", 60.0)
+        softness = parse_float(payload.get("softness"), "softness", 20.0)
+        images: List[Image.Image] = []
+        for name in files:
+            src = crops_dir / name
+            if not src.exists():
+                continue
+            images.append(Image.open(src).convert("RGB"))
+        seams = (
+            compute_stitch_seams(
+                images,
+                max_width=max_width,
+                coefficient_horizontal=coefficient_horizontal,
+                coefficient_vertical=coefficient_vertical,
+                note_rgb=note_rgb,
+                tolerance=tolerance,
+                softness=softness,
+            )
+            if len(images) >= 2
+            else []
+        )
+        return jsonify({
+            "seams": [
+                [round(s[0], 5), round(s[1], 5)] for s in seams
+            ]
+        })
+    except Exception as exc:
+        return json_error(str(exc), 500)
+
+
+@app.post("/api/import_image")
+def import_image():
+    ensure_cache_dirs()
+    job_id = request.form.get("job_id")
+    upload = request.files.get("file")
+    try:
+        if not job_id:
+            return json_error("缺少 job_id。")
+        with STORE_LOCK:
+            job = JOBS.get(job_id)
+        if job is None:
+            return json_error("未知的任务。", 404)
+        if not upload or not upload.filename:
+            return json_error("没有收到图片。")
+        original_name = secure_filename(upload.filename)
+        suffix = Path(original_name).suffix.lower()
+        if suffix not in ALLOWED_IMAGE_EXTENSIONS:
+            return json_error("不支持的图片格式。")
+        crops_dir = RUNS_DIR / job_id / "crops"
+        crops_dir.mkdir(parents=True, exist_ok=True)
+        out_name = f"img_{uuid.uuid4().hex[:10]}{suffix}"
+        upload.save(crops_dir / out_name)
+        with Image.open(crops_dir / out_name) as im:
+            w, h = im.size
+        return jsonify({
+            "file": out_name,
+            "url": f"/api/captures/{job_id}/{out_name}",
+            "w": w,
+            "h": h,
+        })
+    except ValueError as exc:
+        return json_error(str(exc), 400)
     except Exception as exc:
         return json_error(str(exc), 500)
 
@@ -915,6 +1247,94 @@ def insert_captures():
         return json_error(str(exc), 500)
 
 
+@app.post("/api/split_image")
+def split_image():
+    ensure_cache_dirs()
+    payload = request.get_json(force=True, silent=True) or {}
+    try:
+        job_id = payload.get("job_id")
+        with STORE_LOCK:
+            job = JOBS.get(job_id)
+        if job is None:
+            return json_error("未知的任务。", 404)
+        crops_dir = RUNS_DIR / job_id / "crops"
+        src = crops_dir / payload.get("file", "")
+        if not src.exists():
+            return json_error("未知的截图。", 404)
+        img = Image.open(src).convert("RGB")
+        w, h = img.size
+        if h < MIN_SPLIT_PX * 2:
+            return json_error("图片高度不足，无法继续分割。", 400)
+        y = parse_float(payload.get("y"), "y", 0.5)
+        cut = int(round(h * y))
+        cut = max(MIN_SPLIT_PX, min(h - MIN_SPLIT_PX, cut))
+        top = img.crop((0, 0, w, cut))
+        bottom = img.crop((0, cut, w, h))
+        stem = Path(payload.get("file", "x")).stem
+        out_top = f"sp_{stem}_top_{uuid.uuid4().hex[:6]}.png"
+        out_bottom = f"sp_{stem}_bot_{uuid.uuid4().hex[:6]}.png"
+        top.save(crops_dir / out_top)
+        bottom.save(crops_dir / out_bottom)
+        return jsonify({
+            "parts": [
+                {"file": out_top, "url": f"/api/captures/{job_id}/{out_top}", "w": top.width, "h": top.height},
+                {"file": out_bottom, "url": f"/api/captures/{job_id}/{out_bottom}", "w": bottom.width, "h": bottom.height},
+            ]
+        })
+    except ValueError as exc:
+        return json_error(str(exc), 400)
+    except Exception as exc:
+        return json_error(str(exc), 500)
+
+
+@app.post("/api/merge_image")
+def merge_image():
+    ensure_cache_dirs()
+    payload = request.get_json(force=True, silent=True) or {}
+    try:
+        job_id = payload.get("job_id")
+        with STORE_LOCK:
+            job = JOBS.get(job_id)
+        if job is None:
+            return json_error("未知的任务。", 404)
+        crops_dir = RUNS_DIR / job_id / "crops"
+        top_path = crops_dir / payload.get("top", "")
+        bottom_path = crops_dir / payload.get("bottom", "")
+        if not top_path.exists() or not bottom_path.exists():
+            return json_error("未知的截图。", 404)
+        top_img = Image.open(top_path).convert("RGB")
+        bottom_img = Image.open(bottom_path).convert("RGB")
+        tw, th = top_img.size
+        bw, bh = bottom_img.size
+        w = max(tw, bw)
+        h = th + bh
+        merged = Image.new("RGB", (w, h), (255, 255, 255))
+        merged.paste(top_img, (0, 0))
+        merged.paste(bottom_img, (0, th))
+        stem = Path(payload.get("top", "x")).stem
+        out_name = f"mg_{stem}_{uuid.uuid4().hex[:6]}.png"
+        merged.save(crops_dir / out_name)
+        return jsonify({
+            "file": out_name,
+            "url": f"/api/captures/{job_id}/{out_name}",
+            "w": w,
+            "h": h,
+        })
+    except ValueError as exc:
+        return json_error(str(exc), 400)
+    except Exception as exc:
+        return json_error(str(exc), 500)
+
+
+@app.get("/api/source_image/<source_id>")
+def source_image(source_id: str):
+    with STORE_LOCK:
+        source = SOURCES.get(source_id)
+    if source is None or source.get("type") != "image":
+        return json_error("未知的图片源。", 404)
+    return send_file(source["path"])
+
+
 @app.get("/api/jobs/<job_id>")
 def job_status(job_id: str):
     with STORE_LOCK:
@@ -934,6 +1354,27 @@ def job_pdf(job_id: str):
     if job is None or job.get("status") != "done":
         return json_error("PDF 尚未生成。", 404)
     return send_from_directory(RUNS_DIR / job_id, job["pdf_name"], as_attachment=False)
+
+
+@app.get("/api/jobs/<job_id>/long_image")
+def job_long_image(job_id: str):
+    with STORE_LOCK:
+        job = JOBS.get(job_id)
+    if job is None or job.get("status") != "done":
+        return json_error("长图尚未生成。", 404)
+    # 优先用生成时记录的长图文件名；旧会话无 long_name 时回退到固定名推断。
+    long_name = job.get("long_name")
+    path = RUNS_DIR / job_id / long_name if long_name else None
+    if not path or not path.exists():
+        fallback = RUNS_DIR / job_id / "tablatura.png"
+        if not fallback.exists():
+            # 兼容：尝试所有由 pdf_name 派生的 .png。
+            base = job.get("pdf_name") or "tablatura.pdf"
+            fallback = RUNS_DIR / job_id / (base[:-4] + ".png" if base.lower().endswith(".pdf") else base + ".png")
+        if not fallback.exists():
+            return json_error("长图文件不存在。", 404)
+        path = fallback
+    return send_from_directory(RUNS_DIR / job_id, path.name, as_attachment=False)
 
 
 @app.get("/api/previews/<path:filename>")

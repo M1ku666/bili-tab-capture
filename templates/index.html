@@ -1,265 +1,456 @@
 <!doctype html>
 <html lang="zh-CN">
-  <head>
-    <meta charset="utf-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>BiliTabCapture</title>
-    <link rel="stylesheet" href="../static/styles.css">
-  </head>
-  <body>
-    <main class="app-shell">
-      <a class="ghost-link" href="/api/jobs" aria-hidden="true" tabindex="-1"></a>
-      <header class="topbar">
-        <div>
-          <h1>BiliTabCapture</h1>
-          <p>动态谱 PDF 提取器</p>
+
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>BiliTabCapture</title>
+  <link rel="stylesheet" href="../static/styles.css">
+</head>
+
+<body>
+  <main class="app-shell">
+    <a class="ghost-link" href="/api/jobs" aria-hidden="true" tabindex="-1"></a>
+    <header class="topbar">
+      <div>
+        <h1>BiliTabCapture</h1>
+        <p class="tagline-row">动态谱 PDF 提取器 <span class="version-badge">v{{ app_version }}</span>
+          <button class="info-btn" id="infoButton" type="button" aria-label="关于">i</button>
+          <a class="update-link hidden" id="updateLink" href="https://gitee.com/m1ku666/bili-tab-capture/releases" target="_blank" rel="noopener">下载新版本</a>
+        </p>
+      </div>
+      <nav class="stepper" aria-label="流程步骤">
+        <ol>
+          <li data-step="1" class="is-active">1 导入</li>
+          <li class="stepper-sep" aria-hidden="true">&gt;</li>
+          <li data-step="2">2 截图</li>
+          <li class="stepper-sep" aria-hidden="true">&gt;</li>
+          <li data-step="3">3 调整</li>
+          <li class="stepper-sep" aria-hidden="true">&gt;</li>
+          <li data-step="4">4 排版</li>
+        </ol>
+      </nav>
+    </header>
+
+    <section class="panel import-panel" id="importPanel" aria-busy="false">
+      <h2 class="panel-title">导入</h2>
+      <form id="importForm" class="import-form">
+        <div class="import-secondary-row">
+          <label class="field file-field">
+            <span class="file-icon" data-icon="upload" aria-hidden="true"></span>
+            <span class="file-hint">本地视频或图片</span>
+            <span class="file-meta">
+              <span class="file-formats">
+                <code>mp4</code>
+                <code>mov</code>
+                <code>webm</code>
+                <code>mkv</code>
+                <code>png</code>
+                <code>jpg</code>
+                <code>webp</code>
+                <code>bmp</code>
+                <code>gif</code>
+              </span>
+              <span class="file-note">可拖入文件或 Ctrl+V 粘贴图片</span>
+            </span>
+            <input id="localFile" name="file" type="file"
+              accept="video/mp4,video/quicktime,video/webm,video/x-matroska,image/png,image/jpeg,image/webp,image/bmp,image/gif"
+              autocomplete="off">
+          </label>
         </div>
-        <nav class="stepper" aria-label="流程步骤">
-          <ol>
-            <li data-step="1" class="is-active">1 导入</li>
-            <li class="stepper-sep" aria-hidden="true">&gt;</li>
-            <li data-step="2">2 设置</li>
-            <li class="stepper-sep" aria-hidden="true">&gt;</li>
-            <li data-step="3">3 调整</li>
-            <li class="stepper-sep" aria-hidden="true">&gt;</li>
-            <li data-step="4">4 完成</li>
-          </ol>
-        </nav>
-      </header>
-
-      <section class="panel import-panel" id="importPanel" aria-busy="false">
-        <h2 class="panel-title">导入视频</h2>
-        <form id="importForm" class="import-form">
-          <div class="import-secondary-row">
-            <label class="field file-field">
-              <span class="file-hint">拖入视频文件，或点击选择</span>
-              <input id="localFile" name="file" type="file" accept="video/mp4,video/quicktime,video/webm,video/x-matroska" autocomplete="off">
-            </label>
-          </div>
-          <div class="import-divider"><span>或</span></div>
-          <!-- <div class="import-primary-row">
-            <label class="field">
-              <span>粘贴 YouTube 链接</span>
-              <input id="youtubeUrl" name="youtube_url" type="url" placeholder="https://www.youtube.com/watch?v=..." autocomplete="off">
-            </label>
-          </div> -->
-
-          <div class="import-secondary-row">
-            <label class="field">
-              <input id="bvidInput" name="bvid" type="text" placeholder="哔哩哔哩 视频BV号" autocomplete="off">
-            </label>
-            <button class="secondary-button" id="bilibiliLoginButton" type="button">登录高清</button>
-          </div>
-
-          <section class="login-panel hidden" id="loginPanel">
-            <img id="loginQrImage" alt="">
-            <span class="status-line" id="loginStatus"></span>
-          </section>
-          <button class="primary-button import-button" id="importButton" type="submit">导入</button>
-        </form>
-
-        <p class="status-line" id="importStatus"></p>
-      </section>
-
-      <section class="panel workspace hidden" id="workspace" aria-busy="false">
-        <h2 class="preview-title">裁剪预览</h2>
-        <p id="previewTimeHint" class="preview-time-hint"></p>
-        <div class="preview-frame" id="previewFrame" aria-busy="false">
-          <img id="previewImage" alt="视频预览">
-          <div class="crop-overlay" id="cropOverlay">
-            <div class="shade shade-top" id="shadeTop"></div>
-            <div class="shade shade-bottom" id="shadeBottom"></div>
-            <div class="shade shade-left" id="shadeLeft"></div>
-            <div class="shade shade-right" id="shadeRight"></div>
-            <div class="crop-window" id="cropWindow"></div>
-            <button class="crop-handle crop-top" id="cropTop" type="button" aria-label="向上移动裁剪上边界"></button>
-            <button class="crop-handle crop-bottom" id="cropBottom" type="button" aria-label="向下移动裁剪下边界"></button>
-            <button class="crop-handle crop-left" id="cropLeft" type="button" aria-label="向左移动裁剪左边界"></button>
-            <button class="crop-handle crop-right" id="cropRight" type="button" aria-label="向右移动裁剪右边界"></button>
-          </div>
-          <div class="preview-loading-overlay hidden" id="previewLoadingOverlay" role="status" aria-live="polite">
-            <span class="spinner" aria-hidden="true"></span>
-            <span id="previewStatus">更新预览中...</span>
-          </div>
+        <div class="import-divider"><span>或</span></div>
+        <div class="import-secondary-row">
+          <label class="field">
+            <input id="bvidInput" name="bvid" type="text" placeholder="哔哩哔哩 视频BV号" autocomplete="off">
+          </label>
+          <button class="secondary-button" id="bilibiliLoginButton" type="button">登录高清</button>
         </div>
-        <div class="timeline" id="timeline" aria-label="选择开始和结束时间">
-          <div class="timeline-track" id="timelineTrack">
-            <div class="timeline-progress" id="timelineProgress"></div>
-          </div>
-          <button class="timeline-handle timeline-handle-start" id="timelineStartHandle" type="button" aria-label="开始时间"></button>
-          <button class="timeline-handle timeline-handle-end" id="timelineEndHandle" type="button" aria-label="结束时间"></button>
+
+        <button class="primary-button import-button" id="importButton" type="submit">导入</button>
+      </form>
+
+      <p class="status-line" id="importStatus"></p>
+    </section>
+
+    <section class="panel workspace hidden" id="workspace" aria-busy="false">
+      <h2 class="preview-title">截图</h2>
+      <p id="previewTimeHint" class="preview-time-hint"></p>
+      <div class="preview-frame" id="previewFrame" aria-busy="false">
+        <img id="previewImage" alt="视频预览">
+        <div class="crop-overlay" id="cropOverlay">
+          <div class="shade shade-top" id="shadeTop"></div>
+          <div class="shade shade-bottom" id="shadeBottom"></div>
+          <div class="shade shade-left" id="shadeLeft"></div>
+          <div class="shade shade-right" id="shadeRight"></div>
+          <div class="crop-window" id="cropWindow"></div>
+          <button class="crop-handle crop-top" id="cropTop" type="button" aria-label="移动裁剪上边界"></button>
+          <button class="crop-handle crop-bottom" id="cropBottom" type="button" aria-label="移动裁剪下边界"></button>
+          <button class="crop-handle crop-left" id="cropLeft" type="button" aria-label="移动裁剪左边界"></button>
+          <button class="crop-handle crop-right" id="cropRight" type="button" aria-label="移动裁剪右边界"></button>
         </div>
-        <div class="form-grid">
-          <div class="field">
-            <span>开始</span>
-            <div class="time-inputs">
-              <div class="time-part">
-                <input id="startMinInput" type="number" min="0" step="1" value="0" aria-label="开始分钟" autocomplete="off">
-                <span>分</span>
+        <div class="preview-loading-overlay hidden" id="previewLoadingOverlay" role="status" aria-live="polite">
+          <span class="spinner" aria-hidden="true"></span>
+          <span id="previewStatus">更新预览中...</span>
+        </div>
+      </div>
+
+      <details class="advanced" id="advancedSettings">
+        <summary>高级设置</summary>
+        <div class="form-grid advanced-grid">
+          <div class="time-row" id="timeRow">
+            <div class="field time-field">
+              <span>开始</span>
+              <div class="time-inputs">
+                <div class="time-part">
+                  <input id="startMinInput" type="number" min="0" step="1" value="0" aria-label="开始分钟"
+                    autocomplete="off">
+                  <span>分</span>
+                </div>
+                <div class="time-part">
+                  <input id="startSecInput" type="number" min="0" max="59" step="1" value="0" aria-label="开始秒"
+                    autocomplete="off">
+                  <span>秒</span>
+                </div>
               </div>
-              <div class="time-part">
-                <input id="startSecInput" type="number" min="0" max="59" step="1" value="0" aria-label="开始秒" autocomplete="off">
-                <span>秒</span>
+            </div>
+
+            <div class="timeline" id="timeline" aria-label="选择开始和结束时间">
+              <div class="timeline-track" id="timelineTrack">
+                <div class="timeline-progress" id="timelineProgress"></div>
+              </div>
+              <button class="timeline-handle timeline-handle-start" id="timelineStartHandle" type="button"
+                aria-label="开始时间"></button>
+              <button class="timeline-handle timeline-handle-end" id="timelineEndHandle" type="button"
+                aria-label="结束时间"></button>
+              <span class="timeline-label timeline-label-start">00:00</span>
+              <span class="timeline-label timeline-label-end" id="timelineEndLabel"></span>
+            </div>
+
+            <div class="field time-field">
+              <span>结束</span>
+              <div class="time-inputs">
+                <div class="time-part">
+                  <input id="endMinInput" type="number" min="0" step="1" aria-label="结束分钟" autocomplete="off">
+                  <span>分</span>
+                </div>
+                <div class="time-part">
+                  <input id="endSecInput" type="number" min="0" max="59" step="1" aria-label="结束秒" autocomplete="off">
+                  <span>秒</span>
+                </div>
               </div>
             </div>
           </div>
-          <div class="field">
-            <span>结束（留空到结尾）</span>
-            <div class="time-inputs">
-              <div class="time-part">
-                <input id="endMinInput" type="number" min="0" step="1" aria-label="结束分钟" autocomplete="off">
-                <span>分</span>
-              </div>
-              <div class="time-part">
-                <input id="endSecInput" type="number" min="0" max="59" step="1" aria-label="结束秒" autocomplete="off">
-                <span>秒</span>
-              </div>
-            </div>
-          </div>
+          <label class="field">
+            <span>采样间隔 <span class="help-tip" data-tip="每隔多少秒截一帧画面。数值越小越不容易漏小节，但截图更多、处理更慢。" tabindex="0" role="button"
+                aria-label="采样间隔说明">?</span></span>
+            <input id="sampleEvery" type="number" min="0.5" step="0.5" value="2" autocomplete="off">
+          </label>
+          <label class="field">
+            <span>差异阈值 <span class="help-tip" data-tip="判定两帧是否同一画面的差异比例上限。超过该比例视为新画面保留，越低越敏感、截图越多。" tabindex="0"
+                role="button" aria-label="差异阈值说明">?</span></span>
+            <input id="diffThreshold" type="number" min="0" max="1" step="0.001" value="0.010" autocomplete="off">
+          </label>
+          <label class="field">
+            <span>条带半宽 <span class="help-tip" data-tip="播放头竖条左右各忽略的像素宽度。用于去掉移动的播放头，避免干扰去重。" tabindex="0" role="button"
+                aria-label="条带半宽说明">?</span></span>
+            <input id="bandHalfWidth" type="number" min="1" step="1" value="90" autocomplete="off">
+          </label>
+          <label class="field">
+            <span>比较窗口 <span class="help-tip" data-tip="与最近几张已保留截图比较来判重。窗口越大越能识别缓慢变化的画面，但更慢。" tabindex="0" role="button"
+                aria-label="比较窗口说明">?</span></span>
+            <input id="compareWindow" type="number" min="1" step="1" value="1" autocomplete="off">
+          </label>
         </div>
+      </details>
 
-        <details class="advanced">
+      <div class="action-row">
+        <button class="primary-button full-width" id="generateButton" type="button">生成图片</button>
+        <span class="status-line" id="extractStatus"></span>
+      </div>
+
+      <div class="progress-wrap hidden" id="extractProgressWrap">
+        <div class="progress-bar">
+          <div class="progress-fill" id="extractProgressFill"></div>
+        </div>
+        <span class="progress-text" id="extractProgressText"></span>
+      </div>
+    </section>
+
+    <section class="panel adjust-panel hidden" id="adjustPanel" aria-busy="false">
+      <h2 class="panel-title">调整</h2>
+      <p class="panel-sub">检查截图裁剪及小节线</p>
+      <div class="action-row">
+        <button class="primary-button full-width" id="toLayoutButton" type="button">开始排版</button>
+      </div>
+
+      <div class="auto-detect-row">
+        <button class="secondary-button auto-detect-btn" id="autoCropButton" type="button">
+          <span class="auto-detect-label">自动裁剪</span> <span class="help-tip help-tip-inline" data-tip="裁剪可去除相邻截图中重复的小节"
+            aria-label="自动裁剪说明">?</span>
+        </button>
+        <button class="secondary-button auto-detect-btn" id="autoMeasureButton" type="button">
+          <span class="auto-detect-label">自动小节</span> <span class="help-tip help-tip-inline" data-tip="小节线用于在排版时放大图片"
+            aria-label="自动小节说明">?</span>
+        </button>
+      </div>
+
+      <details class="advanced clean-details" id="cleanDetails">
+        <summary>点此去色：提升小节线识别准确度</summary>
+        <div class="form-grid advanced-grid">
+          <label class="field">
+            <span>颜色容差</span>
+            <div class="slider-field">
+              <input id="tolerance" type="range" min="5" max="300" step="1" value="60" autocomplete="off">
+              <input id="toleranceNum" type="number" min="5" max="300" step="1" value="60" autocomplete="off">
+            </div>
+          </label>
+          <label class="field">
+            <span>平滑过渡</span>
+            <div class="slider-field">
+              <input id="softness" type="range" min="1" max="200" step="1" value="20" autocomplete="off">
+              <input id="softnessNum" type="number" min="1" max="200" step="1" value="20" autocomplete="off">
+            </div>
+          </label>
+        </div>
+        <p class="clean-note">后续仍可显示去色前原图</p>
+      </details>
+
+      <!-- <details class="advanced" id="autoDetectSettings">
           <summary>高级设置</summary>
           <div class="form-grid advanced-grid">
             <label class="field">
-              <span>采样间隔 <span class="help-tip" data-tip="每隔多少秒截一帧画面。数值越小越不容易漏小节，但截图更多、处理更慢。" tabindex="0" role="button" aria-label="采样间隔说明">?</span></span>
-              <input id="sampleEvery" type="number" min="0.5" step="0.5" value="2" autocomplete="off">
+              <span>水平线检测系数 <span class="help-tip" data-tip="识别谱表横线的灵敏度阈值（0~1）。数值越小越容易把浅色行或噪点当成谱线，识别出的横线越多；数值越大越严格，可能漏掉较淡的谱线。谱线淡、识别不出小节时可调小。" tabindex="0" role="button" aria-label="水平线检测系数说明">?</span></span>
+              <input id="coeffHorizontal" type="number" min="0.1" max="1" step="0.05" value="0.7" autocomplete="off">
             </label>
             <label class="field">
-              <span>差异阈值 <span class="help-tip" data-tip="判定两帧是否同一画面的差异比例上限。超过该比例视为新画面保留，越低越敏感、截图越多。" tabindex="0" role="button" aria-label="差异阈值说明">?</span></span>
-              <input id="diffThreshold" type="number" min="0" max="1" step="0.001" value="0.010" autocomplete="off">
+              <span>拼接比对缩放宽度 <span class="help-tip" data-tip="比对重叠区域的宽度。数值越大比对越精细、越准确，但更慢；重叠对不准时可适当调大。" tabindex="0" role="button" aria-label="拼接比对缩放宽度说明">?</span></span>
+              <input id="stitchMaxWidth" type="number" min="100" step="50" value="600" autocomplete="off">
             </label>
             <label class="field">
-              <span>条带半宽 <span class="help-tip" data-tip="播放头竖条左右各忽略的像素宽度。用于去掉移动的播放头，避免干扰去重。" tabindex="0" role="button" aria-label="条带半宽说明">?</span></span>
-              <input id="bandHalfWidth" type="number" min="1" step="1" value="90" autocomplete="off">
-            </label>
-            <label class="field">
-              <span>比较窗口 <span class="help-tip" data-tip="与最近几张已保留截图比较来判重。窗口越大越能识别缓慢变化的画面，但更慢。" tabindex="0" role="button" aria-label="比较窗口说明">?</span></span>
-              <input id="compareWindow" type="number" min="1" step="1" value="1" autocomplete="off">
+              <span>竖直线检测系数 <span class="help-tip" data-tip="数值越小越容易把音符符干等误判成小节线，小节线越多；数值越大越严格，可能漏掉较淡的小节线。小节线漏检时调小、误检时调大。" tabindex="0" role="button" aria-label="竖直线检测系数说明">?</span></span>
+              <input id="coeffVertical" type="number" min="0.1" max="1" step="0.05" value="0.8" autocomplete="off">
             </label>
           </div>
-        </details>
+        </details> -->
 
-        <div class="action-row">
-          <button class="primary-button full-width" id="generateButton" type="button">生成图片</button>
-          <span class="status-line" id="extractStatus"></span>
-        </div>
+      <span class="status-line adjust-status" id="adjustStatus"></span>
+      <div class="card-list" id="cardList"></div>
+    </section>
 
-        <section class="job-panel hidden" id="jobPanel">
-          <div class="job-header">
-            <strong id="jobPhase">排队中</strong>
+    <section class="panel layout-panel hidden" id="layoutPanel" aria-busy="false">
+      <h2 class="panel-title">排版</h2>
+      <div class="form-grid layout-form">
+        <label class="field field-wide">
+          <span>标题及作者信息</span>
+          <textarea id="titleArea" rows="3" autocomplete="off"></textarea>
+        </label>
+        <label class="field">
+          <span>图片缩放</span>
+          <div class="slider-field">
+            <input id="scaleSlider" type="range" min="0.5" max="3" step="0.05" value="1" autocomplete="off">
+            <input id="scaleInput" type="number" min="0.5" max="3" step="0.05" value="1" autocomplete="off">
           </div>
-          <div class="stats-grid" id="statsGrid">
-            <span>已检查 <strong id="statChecked">0</strong></span>
-            <span>已跳过 <strong id="statSkipped">0</strong></span>
-            <span>已保留 <strong id="statKept">0</strong></span>
-          </div>
-          <pre class="log-box" id="logBox"></pre>
-        </section>
-      </section>
-
-      <section class="panel adjust-panel hidden" id="adjustPanel" aria-busy="false">
-        <h2 class="panel-title">调整截图</h2>
-        <div class="form-grid adjust-form">
-          <label class="field">
-            <span>标题</span>
-            <input id="titleInput" type="text" autocomplete="off">
-          </label>
-          <label class="field">
-            <span>作者</span>
-            <input id="channelInput" type="text" autocomplete="off">
-          </label>
-          <label class="field">
-            <span>背景颜色</span>
-            <div class="color-inputs">
-              <input id="bgColorHex" type="text" value="#ffffff" maxlength="7" spellcheck="false" autocomplete="off">
-              <input id="bgColor" type="color" value="#ffffff" autocomplete="off">
-            </div>
-          </label>
-          <label class="field">
-            <span>文字颜色</span>
-            <div class="color-inputs">
-              <input id="textColorHex" type="text" value="#000000" maxlength="7" spellcheck="false" autocomplete="off">
-              <input id="textColor" type="color" value="#000000" autocomplete="off">
-            </div>
-          </label>
-          <label class="field">
-            <span>页边距</span>
+        </label>
+        <label class="field">
+          <span>页边距</span>
+          <div class="slider-field">
+            <input id="marginSlider" type="range" min="0" max="200" step="1" value="40" autocomplete="off">
             <input id="pageMargin" type="number" min="0" step="1" value="40" autocomplete="off">
-          </label>
-          <label class="field">
-            <span>行间距</span>
+          </div>
+        </label>
+        <label class="field">
+          <span>行间距</span>
+          <div class="slider-field">
+            <input id="spacingSlider" type="range" min="0" max="120" step="1" value="25" autocomplete="off">
             <input id="imageSpacing" type="number" min="0" step="1" value="25" autocomplete="off">
-          </label>
-        </div>
-
-        <div class="adjust-toolbar">
-          <div class="adjust-toggles">
-            <div class="orientation-toggle">
-              <label><input type="radio" name="orientation" value="portrait" checked autocomplete="off"><span>竖向纸张</span></label>
-              <label><input type="radio" name="orientation" value="landscape" autocomplete="off"><span>横向纸张</span></label>
-            </div>
-            <div class="align-toggle">
-              <label><input type="radio" name="align" value="center" checked autocomplete="off"><span>居中对齐</span></label>
-              <label><input type="radio" name="align" value="left" autocomplete="off"><span>居左对齐</span></label>
-            </div>
-            <label class="toggle">
-              <input id="binarizeInput" type="checkbox" autocomplete="off">
-              <span>去除彩色背景</span>
-            </label>
-            <label class="toggle" id="invertToggle">
-              <input id="invertInput" type="checkbox" autocomplete="off">
-              <span>图像反色</span>
-            </label>
-            <label class="toggle hidden" id="binarizeAutoToggle">
-              <input id="binarizeAuto" type="checkbox" checked autocomplete="off">
-              <span>自动阈值</span>
-            </label>
-            <div class="note-color-toggle hidden" id="noteDarkToggle">
-              <label>
-                <input type="radio" name="noteDark" value="dark" checked autocomplete="off">
-                <span>深色音符</span>
-              </label>
-              <label>
-                <input type="radio" name="noteDark" value="light" autocomplete="off">
-                <span>浅色音符</span>
-              </label>
-            </div>
           </div>
-        </div>
-        <div class="binarize-options hidden" id="binarizeOptions">
-          <p class="auto-threshold-hint">文字线条不清晰或杂色过多时可关闭「自动阈值」进行手动调整</p>
-          <div class="binarize-slider-row" id="binarizeSliderRow">
-            <span class="binarize-side">杂色减少</span>
-            <input id="binarizeThreshold" type="range" min="0" max="255" step="1" value="128" autocomplete="off">
-            <span class="binarize-side">文字清晰</span>
+        </label>
+        <label class="field">
+          <span>标题间距</span>
+          <div class="slider-field">
+            <input id="titleSpacingSlider" type="range" min="40" max="200" step="1" value="130" autocomplete="off">
+            <input id="titleSpacing" type="number" min="40" step="1" value="130" autocomplete="off">
           </div>
-        </div>
-        <button class="primary-button full-width" id="generatePdfButton" type="button">生成 PDF</button>
-        <span class="status-line adjust-status" id="adjustStatus"></span>
-        
-        <div class="page-list" id="pageList"></div>
-      </section>
-
-      <section class="panel done-panel hidden" id="donePanel">
-        <div class="done-header">
-          <div class="done-copy">
-            <h2 class="done-title">PDF 已生成</h2>
-            <p id="doneMeta" class="done-meta"></p>
+        </label>
+        <label class="field">
+          <span>背景颜色</span>
+          <div class="color-inputs">
+            <input id="bgColorHex" type="text" value="#ffffff" maxlength="7" spellcheck="false" autocomplete="off">
+            <button class="eyedropper-btn" id="bgColorEyedrop" type="button" title="从画面取色"
+              aria-label="从画面取背景颜色"></button>
+            <input id="bgColor" type="color" value="#ffffff" autocomplete="off">
           </div>
-          <div class="done-actions">
-            <button class="secondary-button" id="backButton" type="button">返回上一步</button>
-            <button class="secondary-button" id="importNewButton" type="button">导入新视频</button>
-            <a id="resultPdfView" class="secondary-button" href="#" target="_blank" rel="noreferrer">新标签页查看</a>
-            <a id="resultPdfDownload" class="primary-button" href="#" download>下载 PDF</a>
+        </label>
+        <label class="field">
+          <span>文字颜色</span>
+          <div class="color-inputs">
+            <input id="textColorHex" type="text" value="#000000" maxlength="7" spellcheck="false" autocomplete="off">
+            <button class="eyedropper-btn" id="textColorEyedrop" type="button" title="从画面取色"
+              aria-label="从画面取文字颜色"></button>
+            <input id="textColor" type="color" value="#000000" autocomplete="off">
           </div>
+        </label>
+      </div>
+
+      <div class="layout-toolbar">
+        <div class="seg-group" role="radiogroup" aria-label="纸张方向">
+          <label class="seg-btn" title="竖向纸张"><input type="radio" name="orientation" value="portrait" checked
+              autocomplete="off"><span class="seg-icon" data-icon="portrait"></span></label>
+          <label class="seg-btn" title="横向纸张"><input type="radio" name="orientation" value="landscape"
+              autocomplete="off"><span class="seg-icon" data-icon="landscape"></span></label>
         </div>
-        <iframe id="resultPdfFrame" class="pdf-frame" title="成品 PDF 预览"></iframe>
-      </section>
-    </main>
+        <div class="seg-group" role="radiogroup" aria-label="水平对齐">
+          <label class="seg-btn" title="水平靠左"><input type="radio" name="align" value="left" autocomplete="off"><span
+              class="seg-icon" data-icon="align-left"></span></label>
+          <label class="seg-btn" title="水平居中"><input type="radio" name="align" value="center" checked
+              autocomplete="off"><span class="seg-icon" data-icon="align-center"></span></label>
+          <label class="seg-btn" title="水平靠右"><input type="radio" name="align" value="right" autocomplete="off"><span
+              class="seg-icon" data-icon="align-right"></span></label>
+        </div>
+        <div class="seg-group" role="radiogroup" aria-label="竖直对齐">
+          <label class="seg-btn" title="竖直靠上"><input type="radio" name="valign" value="top" checked
+              autocomplete="off"><span class="seg-icon" data-icon="align-top"></span></label>
+          <label class="seg-btn" title="竖直居中"><input type="radio" name="valign" value="center" autocomplete="off"><span
+              class="seg-icon" data-icon="align-middle"></span></label>
+          <label class="seg-btn" title="竖直靠下"><input type="radio" name="valign" value="bottom" autocomplete="off"><span
+              class="seg-icon" data-icon="align-bottom"></span></label>
+        </div>
+        <div class="seg-group" role="radiogroup" aria-label="预览列数">
+          <label class="seg-btn" title="单列预览"><input type="radio" name="previewCols" value="1" checked
+              autocomplete="off"><span class="seg-icon" data-icon="columns-1"></span></label>
+          <label class="seg-btn" title="双列预览"><input type="radio" name="previewCols" value="2" autocomplete="off"><span
+              class="seg-icon" data-icon="columns-2"></span></label>
+        </div>
+        <div class="seg-group">
+          <label class="seg-btn" title="图像反色"><input id="invertInput" type="checkbox" autocomplete="off"><span
+              class="seg-icon" data-icon="contrast"></span></label>
+        </div>
+        <div class="seg-group">
+          <label class="seg-btn recolor-btn" title="去除彩色背景"><input id="recolorInput" type="checkbox"
+              autocomplete="off"><span class="seg-icon" data-icon="droplet-off"></span></label>
+        </div>
+        <span class="recolor-hint" id="recolorHint">去色效果请到上一步调整</span>
+      </div>
 
-    <button class="back-to-top" id="backToTop" type="button" aria-label="回到顶部">↑</button>
+      <div class="stack-actions">
+        <button class="primary-button" id="downloadPdfButton" type="button">下载PDF</button>
+        <button class="secondary-button" id="downloadLongButton" type="button">下载长图</button>
+        <span class="status-line" id="layoutStatus"></span>
+      </div>
+      <div class="progress-wrap hidden" id="generateProgressWrap">
+        <div class="progress-bar">
+          <div class="progress-fill" id="progressFill"></div>
+        </div>
+        <span class="progress-text" id="progressText">正在生成…</span>
+      </div>
 
-    <script src="/static/app.js"></script>
-  </body>
+      <div class="page-list" id="pageList"></div>
+    </section>
+  </main>
+
+  <div class="modal-overlay hidden" id="insertModal" role="presentation">
+    <div class="modal-card" role="dialog" aria-modal="true" aria-labelledby="insertModalTitle">
+      <div class="modal-header">
+        <span class="modal-title" id="insertModalTitle">在下方插入图片</span>
+        <button class="modal-close" id="insertModalClose" type="button" aria-label="关闭">×</button>
+      </div>
+      <div class="modal-body">
+        <label class="file-field modal-file" id="insertFileField">
+          <span class="file-icon" data-icon="upload" aria-hidden="true"></span>
+          <span class="file-hint">本地图片</span>
+          <span class="file-meta">
+            <span class="file-formats">
+              <code>png</code>
+              <code>jpg</code>
+              <code>webp</code>
+              <code>bmp</code>
+              <code>gif</code>
+            </span>
+            <span class="file-note">可拖入，Ctrl+V，可多选</span>
+          </span>
+          <input id="insertFileInput" type="file" accept="image/png,image/jpeg,image/webp,image/bmp,image/gif" multiple
+            autocomplete="off">
+        </label>
+        <div class="import-divider" id="insertDivider"><span>或</span></div>
+        <div class="modal-actions">
+          <button class="primary-button" id="insertVideoButton" type="button">从原视频插入</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div class="modal-overlay hidden" id="noteColorModal" role="presentation">
+    <div class="modal-card" role="dialog" aria-modal="true" aria-labelledby="noteColorModalTitle">
+      <div class="modal-header">
+        <span class="modal-title" id="noteColorModalTitle">选取音符颜色</span>
+        <button class="modal-close" id="noteColorModalClose" type="button" aria-label="关闭">×</button>
+      </div>
+      <div class="modal-body">
+        <div class="note-color-sample">
+          <img id="noteColorSampleImage" alt="第一张截图" draggable="false">
+        </div>
+        <label class="field">
+          <span>音符颜色</span>
+          <div class="color-inputs">
+            <input id="noteColorHex" type="text" value="#000000" maxlength="7" spellcheck="false" autocomplete="off">
+            <button class="eyedropper-btn" id="noteColorEyedrop" type="button" title="从画面取色"
+              aria-label="从画面取音符颜色"></button>
+            <input id="noteColor" type="color" value="#000000" autocomplete="off">
+          </div>
+        </label>
+        <div class="modal-actions modal-actions-row">
+          <button class="primary-button" id="noteColorConfirm" type="button">确定</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div class="modal-overlay hidden" id="loginModal" role="presentation">
+    <div class="modal-card" role="dialog" aria-modal="true" aria-labelledby="loginModalTitle">
+      <div class="modal-header">
+        <span class="modal-title" id="loginModalTitle">登录哔哩哔哩</span>
+        <button class="modal-close" id="loginModalClose" type="button" aria-label="关闭">×</button>
+      </div>
+      <div class="modal-body login-modal-body">
+        <img id="loginQrImage" alt="登录二维码">
+        <span class="status-line" id="loginStatus"></span>
+      </div>
+    </div>
+  </div>
+
+  <div class="modal-overlay hidden" id="infoModal" role="presentation">
+    <div class="modal-card" role="dialog" aria-modal="true" aria-labelledby="infoModalTitle">
+      <div class="modal-header">
+        <span class="modal-title" id="infoModalTitle">关于 BiliTabCapture v{{ app_version }}</span>
+        <button class="modal-close" id="infoModalClose" type="button" aria-label="关闭">×</button>
+      </div>
+      <div class="modal-body about-body">
+        <p class="about-row"><span class="about-label">介绍视频</span><a href="https://www.bilibili.com/video/BV1KXgP6SEZ4" target="_blank" rel="noopener">BV1KXgP6SEZ4</a></p>
+        <p class="about-row"><span class="about-label">漏洞反馈</span><a href="https://space.bilibili.com/315868199" target="_blank" rel="noopener">@壳_sh311</a></p>
+        <p class="about-row"><span class="about-label">版本记录</span><a href="https://gitee.com/m1ku666/bili-tab-capture/releases" target="_blank" rel="noopener">Releases</a></p>
+      </div>
+    </div>
+  </div>
+
+  <div class="modal-overlay hidden" id="updateModal" role="presentation">
+    <div class="modal-card" role="dialog" aria-modal="true" aria-labelledby="updateModalTitle">
+      <div class="modal-header">
+        <span class="modal-title" id="updateModalTitle">发现新版本</span>
+        <button class="modal-close" id="updateModalClose" type="button" aria-label="关闭">×</button>
+      </div>
+      <div class="modal-body">
+        <div class="update-log" id="updateLog"></div>
+        <div class="modal-actions modal-actions-row">
+          <a class="primary-button" id="updateDownloadBtn" href="https://gitee.com/m1ku666/bili-tab-capture/releases" target="_blank" rel="noopener">下载新版本</a>
+          <button class="secondary-button" id="updateSkipBtn" type="button">跳过此版本</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <button class="back-to-top" id="backToTop" type="button" aria-label="回到顶部">↑</button>
+
+  <script src="/static/app.js"></script>
+</body>
+
 </html>

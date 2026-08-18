@@ -21,6 +21,7 @@ echo [2/3] Building single-file exe ...
     --add-data "templates;templates" ^
     --add-data "static;static" ^
     --add-data "bilix.exe;." ^
+    --add-data "VERSION;." ^
     --collect-submodules "yt_dlp" ^
     --collect-submodules "cv2" ^
     app.py || goto :error
@@ -29,7 +30,7 @@ echo [3/3] Done.
 echo.
 echo Output : %~dp0dist\BiliTabCapture.exe
 echo Usage  : copy BiliTabCapture.exe to any Windows PC and double-click it.
-echo          On first run it extracts bilix.exe and creates app_cache/
+echo          On first run it extracts bilix.exe and creates BiliTabCaptrue_cache/
 echo          next to the exe to keep cache and Bilibili login cookie.
 pause
 exit /b 0

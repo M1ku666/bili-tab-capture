@@ -2,6 +2,7 @@ import argparse
 import json
 import os
 import re
+import shutil
 import subprocess
 import tempfile
 import urllib.parse
@@ -34,6 +35,7 @@ else:
 HEADER_FONT_FAMILY = "msyh"   # 标题与作者的字体
 HEADER_TITLE_SIZE = 64        # 标题字号，作者/链接按比例缩小
 HEADER_HEIGHT_RATIO = 0.2     # 标题/作者占页面高度的比例（1=整页，0.1=10%）
+HEADER_LINE_HEIGHT_RATIO = 1.2  # 标题/作者行高 = 字号 × 该比例（与前端 CSS line-height 一致）
 
 
 # --- Bilibili support -----------------------------------------------------
@@ -595,6 +597,60 @@ def binarize_luminance(
     return Image.fromarray(out)
 
 
+def extract_note_mask(
+    image: Image.Image,
+    note_rgb: Tuple[int, int, int],
+    tolerance: float = 60.0,
+    softness: float = 20.0,
+) -> Image.Image:
+    """按音符颜色把图像转成「音符黑、其它白」的灰度图（平滑过渡）。
+
+    逐像素计算与 note_rgb 的 RGB 欧氏距离，再用 smoothstep 在容差附近做平滑
+    过渡：距离小于 (tolerance - softness) 判为音符(黑 0)，大于
+    (tolerance + softness) 判为背景(白 255)，中间平滑过渡，避免锯齿硬边。
+    """
+    rgb = np.array(image.convert("RGB"), dtype=np.float32)
+    note = np.asarray(note_rgb, dtype=np.float32)
+    dist = np.sqrt(np.sum((rgb - note) ** 2, axis=-1))
+
+    softness = max(1.0, float(softness))
+    edge0 = float(tolerance) - softness
+    edge1 = float(tolerance) + softness
+    t = np.clip((dist - edge0) / (edge1 - edge0), 0.0, 1.0)
+    smooth = t * t * (3.0 - 2.0 * t)  # smoothstep：0=音符，1=背景
+    gray = (smooth * 255.0).astype(np.uint8)
+    return Image.fromarray(gray, mode="L")
+
+
+def recolor_gray(
+    gray: Image.Image,
+    text_rgb: Tuple[int, int, int],
+    bg_rgb: Tuple[int, int, int],
+) -> Image.Image:
+    """把「音符黑、背景白」的灰度图染成 text_rgb / bg_rgb，边缘平滑过渡。"""
+    g = np.array(gray.convert("L"), dtype=np.float32) / 255.0  # 0=音符，1=背景
+    text = np.asarray(text_rgb, dtype=np.float32)
+    bg = np.asarray(bg_rgb, dtype=np.float32)
+    out = text[None, None, :] * (1.0 - g[..., None]) + bg[None, None, :] * g[..., None]
+    return Image.fromarray(np.clip(out, 0.0, 255.0).astype(np.uint8))
+
+
+def preprocess_for_detection(
+    image: Image.Image,
+    note_rgb: Optional[Tuple[int, int, int]] = None,
+    tolerance: float = 60.0,
+    softness: float = 20.0,
+) -> Image.Image:
+    """自动检测前的预处理。
+
+    指定 note_rgb 时按音符颜色二值化（音符黑、其它白，去掉彩色背景与高亮）；
+    否则回退到 neutralize_highlight（只中和彩色高亮）。
+    """
+    if note_rgb is not None:
+        return extract_note_mask(image, note_rgb, tolerance, softness).convert("RGB")
+    return neutralize_highlight(image)
+
+
 def detect_playhead_in_image(
     image: Image.Image,
     min_band_pixels: int = 20,
@@ -1013,7 +1069,7 @@ def extract_unique_crops(
         band_info = "sin banda detectada"
         if current_comparison.band_center is not None:
             band_info = (
-                f"频带 x={current_comparison.band_center}, "
+                f"band x={current_comparison.band_center}, "
                 f"peak={current_comparison.peak_score:.1f}"
             )
 
@@ -1108,117 +1164,103 @@ def text_size(draw: ImageDraw.ImageDraw, text: str, font) -> Tuple[int, int]:
     return bbox[2] - bbox[0], bbox[3] - bbox[1]
 
 
+def header_line_height(font) -> int:
+    """标题/作者行高 = 字号 × 固定比例，与前端 CSS line-height 保持一致。"""
+    return max(1, int(round(font.size * HEADER_LINE_HEIGHT_RATIO)))
+
+
 def wrap_text(
     draw: ImageDraw.ImageDraw,
     text: str,
     font,
     max_width: int,
 ) -> List[str]:
-    words = text.split()
-    if not words:
+    # 按字符换行（中英文混排时逐字累加，超宽即断行），与前端 overflow-wrap:anywhere 一致。
+    if not text:
         return []
-
     lines = []
-    current = words[0]
-
-    for word in words[1:]:
-        candidate = f"{current} {word}"
+    current = ""
+    for ch in text:
+        candidate = current + ch
         candidate_w, _ = text_size(draw, candidate, font)
-        if candidate_w <= max_width:
-            current = candidate
+        if current and candidate_w > max_width:
+            lines.append(current.rstrip())
+            current = ch.lstrip()
         else:
-            lines.append(current)
-            current = word
-
-    lines.append(current)
+            current = candidate
+    if current.strip():
+        lines.append(current.rstrip())
     return lines
 
 
 def draw_first_page_header(
     page: Image.Image,
-    metadata: Optional[VideoMetadata],
+    title_lines: Optional[List[str]],
+    source_url: Optional[str],
     page_width: int,
     page_height: int,
     margin: int,
     text_color: str = "181818",
+    title_spacing: Optional[int] = None,
 ) -> int:
-    """在第一页顶部绘制标题 / 作者 / 原链接，返回图片列表的起始 Y 坐标。
+    """在第一页顶部绘制多行标题，返回图片列表的起始 Y 坐标。
 
-    标题、作者与原链接占据整页高度 HEADER_HEIGHT_RATIO 的比例，
-    文字在该区域内垂直居中；原链接同样限制在左右页边距内。
+    title_lines[0] 按标题字号，其余行按作者字号；source_url 以小字右对齐。
+    标题部分由 (title_spacing + 文字 + title_spacing) 组成，而非固定高度占比。
     """
-    header_height = int(page_height * HEADER_HEIGHT_RATIO)
-
-    if metadata is None:
-        return margin
-
-    title = (metadata.display_title or "").strip()
-    channel = (metadata.channel or "").strip()
-    source_url = (metadata.source_url or "").strip()
-
-    if not (title or channel or source_url):
+    lines = [ln.strip() for ln in (title_lines or []) if ln.strip()]
+    url = (source_url or "").strip()
+    if not lines and not url:
         return margin
 
     title_size = max(16, int(HEADER_TITLE_SIZE))
     draw = ImageDraw.Draw(page)
     title_font = load_font(title_size, HEADER_FONT_FAMILY)
-    channel_font = load_font(max(14, int(round(title_size * 0.4375))), HEADER_FONT_FAMILY)
+    author_font = load_font(max(14, int(round(title_size * 0.4375))), HEADER_FONT_FAMILY)
     source_font = load_font(max(12, int(round(title_size * 0.25))), HEADER_FONT_FAMILY)
-
     color = hex_to_rgb(text_color)
     max_text_width = page_width - 2 * margin
 
-    title_lines = wrap_text(draw, title, title_font, max_text_width) if title else []
-    source_lines = wrap_text(draw, source_url, source_font, max_text_width)[:2] if source_url else []
+    spacing = title_spacing if title_spacing is not None else int(page_height * HEADER_HEIGHT_RATIO)
 
-    # 先量出整块文字的高度（不含最后一行之后的留白），用于垂直居中。
-    total_h = 0
-    for idx, line in enumerate(title_lines):
-        total_h += text_size(draw, line, title_font)[1]
-        if idx < len(title_lines) - 1:
-            total_h += 16
-    if title_lines:
-        total_h += 28
-    if channel:
-        total_h += text_size(draw, channel, channel_font)[1] + 20
-    for idx, line in enumerate(source_lines):
-        total_h += text_size(draw, line, source_font)[1]
-        if idx < len(source_lines) - 1:
-            total_h += 8
+    # 逐行：第一行标题字号，其余作者字号；超宽自动换行。
+    entries = []  # (text, font)
+    for i, raw in enumerate(lines):
+        font = title_font if i == 0 else author_font
+        for wl in wrap_text(draw, raw, font, max_text_width) or [raw]:
+            entries.append((wl, font))
+    url_entries = [
+        (wl, source_font)
+        for wl in (wrap_text(draw, url, source_font, max_text_width)[:2] if url else [])
+    ]
 
-    current_y = margin + max(0.0, (header_height - margin - total_h) / 2)
+    # 文字块总高：标题/作者行间 8px，链接块前 12px、行间 4px。
+    text_h = 0
+    for idx, (txt, font) in enumerate(entries):
+        text_h += header_line_height(font)
+        if idx < len(entries) - 1:
+            text_h += 8
+    if url_entries:
+        text_h += 12
+        for idx, (txt, font) in enumerate(url_entries):
+            text_h += header_line_height(font)
+            if idx < len(url_entries) - 1:
+                text_h += 4
 
-    for idx, line in enumerate(title_lines):
-        line_w, line_h = text_size(draw, line, title_font)
-        draw.text(
-            ((page_width - line_w) / 2, current_y),
-            line,
-            fill=color,
-            font=title_font,
-        )
-        current_y += line_h + (16 if idx < len(title_lines) - 1 else 0)
-    if title_lines:
-        current_y += 28
+    header_height = spacing + text_h + spacing
+    y = margin + spacing
 
-    if channel:
-        channel_w, channel_h = text_size(draw, channel, channel_font)
-        draw.text(
-            ((page_width - channel_w) / 2, current_y),
-            channel,
-            fill=color,
-            font=channel_font,
-        )
-        current_y += channel_h + 20
+    for txt, font in entries:
+        w_, _ = text_size(draw, txt, font)
+        draw.text(((page_width - w_) / 2, y), txt, fill=color, font=font)
+        y += header_line_height(font) + 8
 
-    for line in source_lines:
-        line_w, line_h = text_size(draw, line, source_font)
-        draw.text(
-            (page_width - margin - line_w, current_y),
-            line,
-            fill=color,
-            font=source_font,
-        )
-        current_y += line_h + 8
+    if url_entries:
+        y += 4
+        for txt, font in url_entries:
+            w_, _ = text_size(draw, txt, font)
+            draw.text((page_width - margin - w_, y), txt, fill=color, font=font)
+            y += header_line_height(font) + 4
 
     return header_height
 
@@ -1250,6 +1292,592 @@ def crop_image_horizontal_centered(
     return canvas
 
 
+# =====================================================================
+# 鲁棒的小节线（竖线）检测 —— 移植自 score_capture_ref 的 image_process.py
+# =====================================================================
+
+@dataclass
+class _StaffLine:
+    """简化的线段表示。
+
+    start 为法向起始坐标（横线=行号 y，竖线=列号 x），thickness 为线段粗细。
+    direction："H" 表示横线，"V" 表示竖线。
+    """
+
+    start: int
+    thickness: int
+    direction: str
+
+    @property
+    def end_index(self) -> int:
+        return self.start + self.thickness - 1
+
+
+def detect_horizontal_lines(
+    gray: np.ndarray,
+    coefficient: float = 0.7,
+    invert: bool = False,
+    r_pixel_threshold: float = 255.0,
+    r_thickness_threshold: int = 10,
+) -> List[_StaffLine]:
+    """识别白底图中的所有水平线（黑线），返回行线段列表。"""
+    if gray.ndim != 2:
+        gray = cv2.cvtColor(gray, cv2.COLOR_RGB2GRAY)
+    if float(np.average(gray)) < 128:
+        gray = 255 - gray
+
+    img_adaptive = cv2.adaptiveThreshold(
+        gray, 255, cv2.ADAPTIVE_THRESH_MEAN_C, cv2.THRESH_BINARY, 5, 7
+    )
+    average_row = np.average(img_adaptive, axis=1)
+    if invert:
+        hit = average_row >= r_pixel_threshold
+    else:
+        hit = average_row < 255 * coefficient
+
+    lines: List[_StaffLine] = []
+    current_y = 1  # adaptiveThreshold 结果比原图短约 2 像素，等效从第 1 像素开始
+    point_y = 0
+    for i in range(len(average_row)):
+        if bool(hit[i]) and not point_y:
+            point_y = current_y
+        elif not bool(hit[i]) and point_y:
+            thickness = current_y - point_y
+            if not invert or thickness >= r_thickness_threshold:
+                lines.append(
+                    _StaffLine(start=point_y, thickness=thickness, direction="H")
+                )
+            point_y = 0
+        current_y += 1
+    return lines
+
+
+def get_score_lines(horizontal_lines: List[_StaffLine]) -> List[_StaffLine]:
+    """从水平线检测结果中筛选出谱表（staff）部分的横线。"""
+    if len(horizontal_lines) < 3:
+        return []
+    ys = np.asarray([line.start for line in horizontal_lines])
+    distance = ys[1:] - ys[:-1]
+    index = (
+        np.flatnonzero(
+            (distance - np.average(distance)) / (np.std(distance) + 0.1) > 2
+        )
+        + 1
+    )
+    index = np.sort(np.append(index, [0, len(horizontal_lines)]))
+    index = [(int(index[i]), int(index[i + 1])) for i in range(np.shape(index)[0] - 1)]
+    index = [i for i in index if (i[1] - i[0]) > 3]
+    try:
+        result = [horizontal_lines[i:j] for i, j in index][-1]
+    except IndexError:
+        return []
+    return result
+
+
+def _image_preprocess_for_vertical_line_detect(gray: np.ndarray) -> np.ndarray:
+    """将灰度图预处理为「黑底白线」的二值图，用于竖线检测。"""
+    if gray.ndim != 2:
+        img = cv2.cvtColor(gray, cv2.COLOR_RGB2GRAY)
+    else:
+        img = gray
+    if float(np.average(img)) > 128:
+        img = cv2.adaptiveThreshold(
+            img, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 5, 7
+        )
+        img = 255 - img
+    else:
+        img = 255 - img
+        img = cv2.adaptiveThreshold(
+            img, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 5, 7
+        )
+        img = 255 - img
+    return img
+
+
+def _detect_bar_lines(
+    img: np.ndarray,
+    top_line_y: int,
+    bottom_line_y: int,
+    edge_top: int,
+    edge_bottom: int,
+    coefficient: float,
+) -> List[np.ndarray]:
+    """img 为「黑底白线」二值图，返回每条小节线对应的连续列索引组。"""
+    sum_columns = np.sum(img[top_line_y:bottom_line_y], axis=0).astype(np.float64)
+    sum_columns_ex = np.sum(img[edge_top:edge_bottom], axis=0).astype(np.float64)
+
+    columns_midpoint = (np.max(sum_columns) + np.min(sum_columns)) // 2
+    sum_columns[np.where(sum_columns < columns_midpoint)[0]] = 0
+    columns_ex_midpoint = (np.max(sum_columns_ex) + np.min(sum_columns_ex)) // 2
+    sum_columns_ex[np.where(sum_columns_ex < columns_ex_midpoint)[0]] = 0
+
+    if sum_columns.shape[0] == 0 or sum_columns_ex.shape[0] == 0:
+        return []
+    bar_lines = np.where(
+        (
+            sum_columns / sum_columns.shape[0]
+            - sum_columns_ex / sum_columns_ex.shape[0] * coefficient
+        )
+        > 0
+    )[0]
+    if bar_lines.size == 0:
+        return []
+
+    # 去除上下不对称（方差过大）的列，过滤音符符干等非小节线。
+    std_y = np.std(img[top_line_y:bottom_line_y, bar_lines], axis=0)
+    bar_lines = np.delete(bar_lines, np.where(std_y > 100)[0])
+    if bar_lines.size == 0:
+        return []
+
+    # 去除前景（白色）占比过少的列。
+    white_ratio_y = (
+        np.sum(img[top_line_y:bottom_line_y, bar_lines], axis=0)
+        / 255
+        / (bottom_line_y - top_line_y)
+    )
+    bar_lines = np.delete(bar_lines, np.where(white_ratio_y < 0.93)[0])
+    if bar_lines.size == 0:
+        return []
+
+    # 将连续的列合并成组，每组即一根小节线。
+    split_index = np.where((bar_lines[1:] - bar_lines[:-1]) != 1)[0] + 1
+    split_index = np.sort(np.append(split_index, [0, len(bar_lines)]))[1:-1]
+    return list(np.split(bar_lines, split_index))
+
+
+def detect_vertical_lines(
+    gray: np.ndarray,
+    horizontal_lines: Optional[List[_StaffLine]] = None,
+    coefficient: float = 0.8,
+) -> List[_StaffLine]:
+    """识别谱表区域内的竖直线（小节线），返回竖线段列表。"""
+    img = _image_preprocess_for_vertical_line_detect(gray)
+    if horizontal_lines is None:
+        horizontal_lines = detect_horizontal_lines(img)
+    if not horizontal_lines:
+        return []
+    horizontal_lines = get_score_lines(horizontal_lines)
+    if not horizontal_lines:
+        return []
+
+    top_line_y = horizontal_lines[0].start
+    bottom_line_y = horizontal_lines[-1].end_index
+    expand = int((bottom_line_y - top_line_y) / 5)
+    edge_top = top_line_y - expand if top_line_y - expand > 0 else 0
+    edge_bottom = bottom_line_y + expand
+    if edge_bottom >= (h := img.shape[0]):
+        edge_bottom = h - 1
+
+    kernel_h = int((bottom_line_y - top_line_y) / 15)
+    kernel_h = kernel_h if kernel_h >= 1 else 1
+    vertical_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (2, kernel_h))
+    img = cv2.morphologyEx(img, cv2.MORPH_CLOSE, vertical_kernel)
+
+    groups = _detect_bar_lines(
+        img, top_line_y, bottom_line_y, edge_top, edge_bottom, coefficient
+    )
+    result: List[_StaffLine] = []
+    for group in groups:
+        if group.size == 0:
+            continue
+        result.append(
+            _StaffLine(start=int(group[0]), thickness=int(group.size), direction="V")
+        )
+    return result
+
+
+def detect_barlines_robust(
+    image: Image.Image,
+    coefficient_horizontal: float = 0.7,
+    coefficient_vertical: float = 0.8,
+    min_margin: int = 3,
+) -> List[int]:
+    """鲁棒的小节线（竖线）检测，返回升序的 x 像素坐标。
+
+    与简单的「逐列墨迹占比」方法不同，这里先定位谱表横线区域，再在该区域内做
+    形态学闭运算连接断点，并利用上下对称性/白色占比过滤音符符干，最后合并
+    反复记号（“||”“:|:”）等过近的双竖线。
+    """
+    gray = np.array(ImageOps.grayscale(image), dtype=np.uint8)
+    horizontal_lines = detect_horizontal_lines(gray, coefficient_horizontal)
+    vertical_lines = detect_vertical_lines(gray, horizontal_lines, coefficient_vertical)
+    if not vertical_lines:
+        return []
+
+    centers = np.asarray(
+        [line.start + (line.thickness - 1) / 2.0 for line in vertical_lines]
+    )
+    if centers.size > 1:
+        distance = centers[1:] - centers[:-1]
+        avg = float(np.average(distance))
+        if avg > 0:
+            # 合并过近的相邻竖线（反复记号的双竖线）。
+            merged: List[float] = []
+            i = 0
+            while i < centers.size:
+                j = i
+                while j + 1 < centers.size and centers[j + 1] - centers[j] < avg / 5.0:
+                    j += 1
+                merged.append(float(np.mean(centers[i : j + 1])))
+                i = j + 1
+            centers = np.asarray(merged)
+
+    w = image.width
+    return [
+        int(round(c))
+        for c in centers
+        if min_margin <= int(round(c)) <= w - min_margin
+    ]
+
+
+def _detect_measure_barlines_heuristic(
+    image: Image.Image,
+    ink_threshold: int = 150,
+    staff_row_ratio: float = 0.30,
+    span_ratio: float = 0.50,
+    merge_gap: int = 4,
+    min_margin: int = 3,
+) -> List[int]:
+    """旧版的逐列墨迹占比启发式，作为鲁棒检测无结果时的回退。"""
+    gray = np.array(ImageOps.grayscale(image), dtype=np.uint8)
+    if float(gray.mean()) < 128:
+        gray = 255 - gray
+    h, w = gray.shape
+    ink = gray < ink_threshold
+
+    row_ratio = ink.sum(axis=1).astype(np.float64) / max(1, w)
+    staff_rows = np.where(row_ratio >= staff_row_ratio)[0]
+    if staff_rows.size < 6:
+        top, bottom = 0, h - 1
+    else:
+        top, bottom = int(staff_rows.min()), int(staff_rows.max())
+
+    band_h = bottom - top + 1
+    if band_h < 6:
+        return []
+
+    col_ink = ink[top:bottom + 1, :].sum(axis=0).astype(np.float64)
+    col_ratio = col_ink / band_h
+    candidates = np.where(col_ratio >= span_ratio)[0]
+
+    if candidates.size == 0:
+        return []
+
+    groups: List[List[int]] = []
+    cur = [int(candidates[0])]
+    for x in candidates[1:]:
+        if int(x) - cur[-1] <= merge_gap:
+            cur.append(int(x))
+        else:
+            groups.append(cur)
+            cur = [int(x)]
+    groups.append(cur)
+
+    centers = [int(round(sum(g) / len(g))) for g in groups]
+    return [x for x in centers if min_margin <= x <= w - min_margin]
+
+
+def detect_measure_barlines(
+    image: Image.Image,
+    ink_threshold: int = 150,
+    staff_row_ratio: float = 0.30,
+    span_ratio: float = 0.50,
+    merge_gap: int = 4,
+    min_margin: int = 3,
+    coefficient_horizontal: float = 0.7,
+    coefficient_vertical: float = 0.8,
+) -> List[int]:
+    """检测谱面（tab）里的小节线（竖线），返回升序的 x 像素坐标。
+
+    优先使用鲁棒检测（先定位谱表横线，再做形态学竖线检测）；若未检出，
+    回退到旧的逐列墨迹占比启发式。
+    """
+    bars = detect_barlines_robust(
+        image,
+        coefficient_horizontal=coefficient_horizontal,
+        coefficient_vertical=coefficient_vertical,
+        min_margin=min_margin,
+    )
+    if bars:
+        return bars
+    return _detect_measure_barlines_heuristic(
+        image,
+        ink_threshold=ink_threshold,
+        staff_row_ratio=staff_row_ratio,
+        span_ratio=span_ratio,
+        merge_gap=merge_gap,
+        min_margin=min_margin,
+    )
+
+
+def split_into_measures(image: Image.Image, bars: List[int]) -> List[Image.Image]:
+    """把一张图按小节线（含图片左右边界）切成若干竖条。"""
+    w, h = image.size
+    cuts = [0] + sorted(set(int(x) for x in bars if 0 <= x <= w)) + [w]
+    strips: List[Image.Image] = []
+    for i in range(len(cuts) - 1):
+        x0, x1 = cuts[i], cuts[i + 1]
+        if x1 - x0 >= 1:
+            strips.append(image.crop((x0, 0, x1, h)))
+    return strips
+
+
+def _best_stitch_offset(a: np.ndarray, b: np.ndarray) -> float:
+    """返回 a、b（灰度图）之间最佳水平重叠偏移（相对 a 宽的 0..1 比例）。
+
+    即 a 的右 d 列与 b 的左 d 列内容重合时，MSE 最小的 d。
+    """
+    h = min(a.shape[0], b.shape[0])
+    a = a[:h, :]
+    b = b[:h, :]
+    wa, wb = a.shape[1], b.shape[1]
+    max_d = min(wa, wb) - 1
+    if max_d < 8:
+        return 0.0
+
+    d_min = max(1, int(max_d * 0.15))
+    d_max = int(max_d * 0.85)
+    step = max(1, (d_max - d_min) // 160)
+
+    best_d, best_err = 0, float("inf")
+    for d in range(d_min, d_max + 1, step):
+        err = float(np.mean((a[:, -d:].astype(np.float64) - b[:, :d].astype(np.float64)) ** 2))
+        if err < best_err:
+            best_err, best_d = err, d
+    # 局部细化
+    lo = max(d_min, best_d - step)
+    hi = min(d_max, best_d + step)
+    for d in range(lo, hi + 1):
+        err = float(np.mean((a[:, -d:].astype(np.float64) - b[:, :d].astype(np.float64)) ** 2))
+        if err < best_err:
+            best_err, best_d = err, d
+    return best_d / wa
+
+
+def _to_gray_resized(img: Image.Image, max_width: int) -> Tuple[np.ndarray, float]:
+    """灰度化并按最大宽度缩放，返回 (灰度数组, 缩放比例)。"""
+    g = np.array(ImageOps.grayscale(img), dtype=np.uint8)
+    ratio = 1.0
+    if g.shape[1] > max_width:
+        ratio = max_width / g.shape[1]
+        g = cv2.resize(
+            g,
+            (max_width, max(1, int(round(g.shape[0] * ratio)))),
+            interpolation=cv2.INTER_AREA,
+        )
+    return g, ratio
+
+
+def neutralize_highlight(
+    image: Image.Image,
+    saturation_threshold: int = 30,
+    dark_ink_v: int = 140,
+    light_ink_v: int = 140,
+) -> Image.Image:
+    """中和「当前小节」的彩色高亮背景，保留黑白谱线。
+
+    谱面是黑/白（可能被高亮轻微染色），高亮背景是彩色且较饱和。思路：
+      1) 饱和度通道 + 现有蓝/绿目标色共同定位「彩色」像素；
+      2) 按整体明暗判断谱面极性，用亮度把「谱线（墨迹）」保护起来，避免
+         高亮把黑/白谱线也轻微染色后被误擦；
+      3) 用非彩色、非谱线的像素估算普通背景色，把高亮背景填回背景色，
+         使高亮两侧的伪竖边消失、高亮区内的谱线保留。
+    """
+    rgb = np.array(image.convert("RGB"), dtype=np.uint8)
+    hsv = cv2.cvtColor(rgb, cv2.COLOR_RGB2HSV)
+    sat = hsv[:, :, 1]
+    val = hsv[:, :, 2]
+
+    # 彩色掩码：较饱和像素 + 现有蓝/绿/目标色（覆盖较淡的蓝绿高亮）
+    color_mask = (sat > saturation_threshold).astype(np.uint8) * 255
+    color_mask = cv2.bitwise_or(color_mask, create_blue_green_mask(image))
+    # 轻微膨胀，把高亮的柔和边缘一并覆盖
+    color_mask = cv2.dilate(color_mask, np.ones((5, 5), np.uint8), iterations=1)
+
+    # 谱线（墨迹）保护：按整体明暗决定谱线是暗色还是亮色
+    gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
+    if float(gray.mean()) >= 128:
+        ink = val < dark_ink_v  # 浅底深字：暗像素是谱线
+    else:
+        ink = val > light_ink_v  # 深底浅字：亮像素是谱线
+
+    colored = color_mask > 0
+    to_fill = colored & ~ink
+    if not np.any(to_fill):
+        return image
+
+    # 普通背景 = 非彩色、非谱线；用它估算背景色，再把高亮填回背景色
+    normal = ~colored & ~ink
+    if int(normal.sum()) < 100:
+        bg = np.median(rgb.reshape(-1, 3), axis=0)
+    else:
+        bg = np.median(rgb[normal], axis=0)
+
+    out = rgb.copy()
+    out[to_fill] = bg.astype(np.uint8)
+    return Image.fromarray(out)
+
+
+def _snap_to_barline(value: float, bars: List[int], width: int) -> float:
+    """把归一化位置 value 吸附到最近的小节线（归一化），无小节线时原样返回。"""
+    if not bars:
+        return value
+    norm = [b / width for b in bars]
+    return min(norm, key=lambda x: abs(x - value))
+
+
+def _best_barline_seam(
+    img_a: Image.Image,
+    img_b: Image.Image,
+    bars_a: List[int],
+    bars_b: List[int],
+    max_width: int = 600,
+) -> Optional[Tuple[float, float]]:
+    """在相邻两张截图中寻找同一根小节线作为拼接缝。
+
+    返回 (right_of_a, left_of_b)，均为归一化（0..1）的小节线位置：
+    a 的右裁剪边界 = right_of_a，b 的左裁剪边界 = left_of_b。
+    找不到可靠的小节线对时返回 None。
+
+    对每个 (a 中的小节线 p, b 中的小节线 q) 组合，计算其对应的重叠宽度
+    d = (宽_a - p) + q，并比较 a 右 d 列与 b 左 d 列的内容，MSE 最小者为
+    最佳拼接缝——这就把拼接位置锁定在小节线上。
+    """
+    wa, wb = img_a.width, img_b.width
+    ga, ra = _to_gray_resized(img_a, max_width)
+    gb, rb = _to_gray_resized(img_b, max_width)
+    h = min(ga.shape[0], gb.shape[0])
+    ga = ga[:h]
+    gb = gb[:h]
+    dwa, dwb = ga.shape[1], gb.shape[1]
+
+    best: Optional[Tuple[float, float, float]] = None  # (err, p_norm, q_norm)
+    for x_p in bars_a:  # 原图像素坐标
+        p = int(round(x_p * ra))
+        for x_q in bars_b:
+            q = int(round(x_q * rb))
+            d = (dwa - p) + q  # 该小节线对对应的重叠宽度（缩放后像素）
+            if d < 8 or d >= min(dwa, dwb):
+                continue
+            err = float(
+                np.mean(
+                    (ga[:, -d:].astype(np.float64) - gb[:, :d].astype(np.float64)) ** 2
+                )
+            )
+            if best is None or err < best[0]:
+                best = (err, x_p / wa, x_q / wb)
+
+    if best is None:
+        return None
+    return (best[1], best[2])
+
+
+def compute_stitch_seams(
+    images: List[Image.Image],
+    max_width: int = 600,
+    coefficient_horizontal: float = 0.7,
+    coefficient_vertical: float = 0.8,
+    note_rgb: Optional[Tuple[int, int, int]] = None,
+    tolerance: float = 60.0,
+    softness: float = 20.0,
+) -> List[Tuple[float, float]]:
+    """返回相邻截图之间的拼接缝，长度 len(images)-1。
+
+    每条缝为 (right_of_left, left_of_right)，均归一化到 0..1：
+    - right_of_left：左侧截图的右裁剪边界（应落在小节线上）；
+    - left_of_right：右侧截图的左裁剪边界（应落在小节线上）。
+
+    拼接缝优先选择两张截图中共有的小节线，从而保证拼接处一定在小节线上；
+    无法检出可靠小节线对时回退到旧的盲 MSE 重叠偏移。
+    """
+    cleaned = [
+        preprocess_for_detection(im, note_rgb, tolerance, softness) for im in images
+    ]
+    # 与 /api/detect_measures 使用同一套检测（含启发式回退），保证拼接缝的小节线
+    # 一定出现在前端拿到的 measures 列表中。
+    bars = [
+        detect_measure_barlines(
+            im,
+            coefficient_horizontal=coefficient_horizontal,
+            coefficient_vertical=coefficient_vertical,
+        )
+        for im in cleaned
+    ]
+
+    seams: List[Tuple[float, float]] = []
+    for i in range(len(images) - 1):
+        seam = _best_barline_seam(
+            cleaned[i], cleaned[i + 1], bars[i], bars[i + 1], max_width
+        )
+        if seam is None:
+            ga, _ = _to_gray_resized(cleaned[i], max_width)
+            gb, _ = _to_gray_resized(cleaned[i + 1], max_width)
+            o = _best_stitch_offset(ga, gb)
+            left = _snap_to_barline(o, bars[i + 1], images[i + 1].width)
+            right = _snap_to_barline(1.0 - o, bars[i], images[i].width)
+            seam = (right, left)
+        seams.append(seam)
+    return seams
+
+
+def layout_rows(
+    images: List[Image.Image],
+    content_w: int,
+    margin: int,
+    spacing: int,
+    fit_width: bool = True,
+    align: str = "left",
+    valign: str = "top",
+) -> List[Tuple[List[Tuple[Image.Image, int, int, int, int]], int]]:
+    """把图片从左到右排列、放满一行换行，返回 [(行内项, 行高), ...]。
+
+    每个行内项为 (img, x, w, h, dy)。align 控制水平对齐（left/center/right），
+    valign 控制同一行内不同高度图片的竖直对齐（top/center/bottom）。
+    """
+    rows: List[Tuple[List[Tuple[Image.Image, int, int, int, int]], int]] = []
+    row: List[Tuple[Image.Image, int, int]] = []  # 暂存 (img, w, h)，x/dy 在换行时再定
+    row_used = 0
+    row_h = 0
+
+    def flush() -> List[Tuple[Image.Image, int, int, int, int]]:
+        nonlocal row, row_used
+        offset = 0
+        if align == "center" and row_used < content_w:
+            offset = (content_w - row_used) // 2
+        elif align == "right" and row_used < content_w:
+            offset = content_w - row_used
+        out: List[Tuple[Image.Image, int, int, int, int]] = []
+        px = margin + offset
+        for img, w, h in row:
+            dy = 0
+            if valign == "center":
+                dy = (row_h - h) // 2
+            elif valign == "bottom":
+                dy = row_h - h
+            out.append((img, px, w, h, dy))
+            px += w
+        row = []
+        row_used = 0
+        return out
+
+    for img in images:
+        w, h = img.size
+        if fit_width and w > content_w:
+            r = content_w / w
+            w = content_w
+            h = int(round(h * r))
+            img = img.resize((w, h), RESAMPLE)
+        if row and row_used + w > content_w:
+            rows.append((flush(), row_h))
+            row_h = 0
+        row.append((img, w, h))
+        row_used += w
+        row_h = max(row_h, h)
+    if row:
+        rows.append((flush(), row_h))
+    return rows
+
+
 def build_pdf_from_images(
     images_dir: Path,
     output_pdf: Path,
@@ -1262,14 +1890,15 @@ def build_pdf_from_images(
     bg_color: str = "white",
     text_color: str = "181818",
     align: str = "left",
+    valign: str = "top",
     fit_width: bool = True,
+    title_lines: Optional[List[str]] = None,
+    title_spacing: Optional[int] = None,
+    source_url: Optional[str] = None,
 ):
     """
-    每张图片独占一行、自上而下堆叠生成 PDF。
-    第一页顶部是标题/作者/原链接页头，之后每页底部都有页码。
-    spacing 为相邻两图（行）之间的垂直间距；align 为水平对齐（left/center）。
-    当 fit_width=True 时把每张图缩放到内容区宽度（CLI 直接使用原始截图）；
-    传 False 表示图片已按基准缩放裁切好，只做水平对齐、不再缩放。
+    按小节横向排版生成 PDF：每张（已处理好的）图片从左到右排列、放满一行换行，
+    超过一页时翻页。第一页顶部是标题/作者页头，每页底部有页码。
     """
     image_paths = sorted(images_dir.glob("*.png"))
     if not image_paths:
@@ -1281,37 +1910,34 @@ def build_pdf_from_images(
         page_width, page_height = page_height, page_width
 
     content_w = page_width - 2 * margin
+    images = [Image.open(p).convert("RGB") for p in image_paths]
 
-    pages = []
-    page = Image.new("RGB", (page_width, page_height), bg_color)
-
-    current_y = draw_first_page_header(
-        page, metadata, page_width, page_height, margin,
-        text_color=text_color,
+    if title_lines is None and metadata is not None:
+        title_lines = [
+            ln for ln in [(metadata.display_title or "").strip(), (metadata.channel or "").strip()]
+            if ln
+        ]
+    src_url = source_url if source_url is not None else (
+        metadata.source_url if metadata is not None else None
     )
 
-    for img_path in image_paths:
-        img = Image.open(img_path).convert("RGB")
-        w, h = img.size
-        if fit_width:
-            # 每张图统一缩放到内容区宽度（与前端预览一致）。
-            ratio = content_w / w
-            w = content_w
-            h = int(round(h * ratio))
-            img = img.resize((w, h), RESAMPLE)
+    rows = layout_rows(images, content_w, margin, spacing, fit_width, align=align, valign=valign)
 
-        x = margin
-        if align == "center":
-            x = margin + (content_w - w) // 2
+    pages: List[Image.Image] = []
+    page = Image.new("RGB", (page_width, page_height), bg_color)
+    current_y = draw_first_page_header(
+        page, title_lines, src_url, page_width, page_height, margin,
+        text_color=text_color, title_spacing=title_spacing,
+    )
 
-        # 翻页：本图放不下时另起一页
-        if current_y + h + margin + footer_height > page_height:
+    for row, row_h in rows:
+        if current_y + row_h + margin + footer_height > page_height:
             pages.append(page)
             page = Image.new("RGB", (page_width, page_height), bg_color)
             current_y = margin
-
-        page.paste(img, (x, current_y))
-        current_y += h + spacing
+        for img, x, w, h, dy in row:
+            page.paste(img, (x, current_y + dy))
+        current_y += row_h + spacing
 
     pages.append(page)
 
@@ -1338,6 +1964,62 @@ def build_pdf_from_images(
     )
 
     return len(pages)
+
+
+def build_long_image(
+    images_dir: Path,
+    output_png: Path,
+    page_width: int = 1654,
+    margin: int = 40,
+    spacing: int = 25,
+    bg_color: str = "white",
+    text_color: str = "181818",
+    align: str = "left",
+    valign: str = "top",
+    fit_width: bool = True,
+    title_lines: Optional[List[str]] = None,
+    title_spacing: Optional[int] = None,
+    source_url: Optional[str] = None,
+) -> int:
+    """把图片按行横向排版，输出一张竖向长图，返回长图高度（像素）。"""
+    image_paths = sorted(images_dir.glob("*.png"))
+    if not image_paths:
+        raise RuntimeError("没有可用于生成长图的图像。")
+
+    content_w = page_width - 2 * margin
+    images = [Image.open(p).convert("RGB") for p in image_paths]
+    rows = layout_rows(images, content_w, margin, spacing, fit_width, align=align, valign=valign)
+
+    total_h = margin
+    header_h = draw_first_page_header(
+        Image.new("RGB", (1, 1)), title_lines, source_url, page_width, 2339, margin,
+        text_color=text_color, title_spacing=title_spacing,
+    )
+    # 重新量一次页头高度（上面的占位图只是用来量文字高度）
+    if title_lines or source_url:
+        total_h = header_h
+    else:
+        total_h = margin
+
+    for _, row_h in rows:
+        total_h += row_h + spacing
+
+    canvas = Image.new("RGB", (page_width, max(1, total_h)), bg_color)
+    if title_lines or source_url:
+        current_y = draw_first_page_header(
+            canvas, title_lines, source_url, page_width, 2339, margin,
+            text_color=text_color, title_spacing=title_spacing,
+        )
+    else:
+        current_y = margin
+
+    for row, row_h in rows:
+        for img, x, w, h, dy in row:
+            canvas.paste(img, (x, current_y + dy))
+        current_y += row_h + spacing
+
+    canvas.save(output_png)
+    return canvas.height
 
 
 def main():

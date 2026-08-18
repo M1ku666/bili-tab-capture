@@ -13,17 +13,24 @@
 - 谱面背景为彩色的视频
 - 全屏动态谱视频
 - 不同段落的谱面高度不一致的视频
+- 从图片导入谱面进行排版
 
-### 手动调整
+### 支持手动调整
+- 调整图片缩放
 - 裁切或删去截图，去除重复部分
 - 补插两次截图间隔之间缺失的截图
 - 图像反色，去除彩色背景，自定义背景及字体颜色
-- 图像对齐支持居中对齐、左对齐
 - 页边距，图片间距设置
+- 图像水平和竖直的对齐设置
 - 纸张横竖方向设置
 - 标题支持非英文字符
 - 实时预览调整效果
 - 更方便的视频时间裁切及预览
+
+### 其他功能
+- 导出为长图
+- 自动识别小节线
+- 自动裁剪去重
 
 ## 声明
 
@@ -31,13 +38,11 @@
 
 登录由[bilix](https://github.com/Koril33/bilix)处理，风险与本项目无关
 
+## 致谢
 
-
-使用到的开源项目：
-
-- [TabCapture](https://github.com/santiRostan/TabCapture)
-- [bilix](https://github.com/Koril33/bilix)
-
+- [santiRostan/TabCapture](https://github.com/santiRostan/TabCapture) 项目框架及截图算法
+- [Koril33/bilix](https://github.com/Koril33/bilix) 哔哩哔哩视频下载
+- [Carrot-shreds/score_capture](https://github.com/Carrot-shreds/score_capture) 自动识别小节线及裁剪去重
 
 ## 配置
 
