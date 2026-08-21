@@ -15,7 +15,7 @@ env/
 capturas_tablatura/
 debug_comparacion_tablatura/
 video_cache/
-BiliTabCaptrue_cache/
+BiliTabCapture_cache/
 
 # Local/editor files
 .idea/

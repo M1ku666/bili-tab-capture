@@ -2801,7 +2801,7 @@ function compareVersions(a, b) {
   return 0;
 }
 
-// 读取本地已跳过的版本（BiliTabCaptrue_cache/skipped_version.txt）。
+// 读取本地已跳过的版本（BiliTabCapture_cache/skipped_version.txt）。
 async function readSkippedVersion() {
   try {
     const res = await fetch("/api/skipped_version", { method: "GET" });
@@ -2813,7 +2813,7 @@ async function readSkippedVersion() {
   }
 }
 
-// 记录本次启动要跳过的版本（写入 BiliTabCaptrue_cache）。
+// 记录本次启动要跳过的版本（写入 BiliTabCapture_cache）。
 async function writeSkippedVersion(version) {
   try {
     await fetch("/api/skipped_version", {

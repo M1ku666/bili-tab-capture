@@ -49,7 +49,7 @@ from tab_extractor import (
 
 
 ROOT_DIR = data_dir()
-CACHE_DIR = ROOT_DIR / "BiliTabCaptrue_cache"
+CACHE_DIR = ROOT_DIR / "BiliTabCapture_cache"
 UPLOADS_DIR = CACHE_DIR / "uploads"
 PREVIEWS_DIR = CACHE_DIR / "previews"
 RUNS_DIR = CACHE_DIR / "runs"
