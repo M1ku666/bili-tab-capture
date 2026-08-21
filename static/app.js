@@ -288,8 +288,10 @@ function clearStatuses() {
   setStatus(els.layoutStatus, "");
 }
 
-// 通知气泡：短暂弹出后自动消失。
-function showToast(message, mode = "") {
+// 通知气泡。
+// 默认短暂弹出后自动消失；传入 { persist: true } 时返回控制器，用于「正在…」通知，
+// 该通知会一直显示，直到调用 controller.resolve(结果文案, 模式) 后更新为成功/失败通知。
+function showToast(message, mode = "", opts = {}) {
   let host = document.querySelector(".toast-host");
   if (!host) {
     host = document.createElement("div");
@@ -297,14 +299,32 @@ function showToast(message, mode = "") {
     document.body.appendChild(host);
   }
   const toast = document.createElement("div");
-  toast.className = "toast" + (mode ? ` toast-${mode}` : "");
+  toast.className = "toast" + (mode ? ` toast-${mode}` : "") + (opts.persist ? " toast-pending" : "");
   toast.textContent = message;
   host.appendChild(toast);
   requestAnimationFrame(() => toast.classList.add("is-visible"));
+
+  if (opts.persist) {
+    return {
+      resolve(nextMessage, nextMode = "") {
+        toast.className = "toast" + (nextMode ? ` toast-${nextMode}` : "");
+        toast.textContent = nextMessage;
+        toast.classList.add("is-visible");
+        setTimeout(() => dismissToast(toast), 2600);
+      },
+    };
+  }
+
+  setTimeout(() => dismissToast(toast), 2600);
+  return null;
+}
+
+function dismissToast(toast) {
+  if (!toast.isConnected) return;
+  toast.classList.remove("is-visible");
   setTimeout(() => {
-    toast.classList.remove("is-visible");
-    setTimeout(() => toast.remove(), 240);
-  }, 2600);
+    if (toast.isConnected) toast.remove();
+  }, 240);
 }
 
 function setControlBusy(controls, busy) {
@@ -1842,7 +1862,7 @@ async function insertFromVideo(index) {
     }
   }
   state.inserting = true;
-  showToast("正在插入...");
+  const pending = showToast("正在插入...", "", { persist: true });
   try {
     const data = await fetchJson("/api/insert_captures", {
       method: "POST",
@@ -1851,7 +1871,7 @@ async function insertFromVideo(index) {
     });
     const inserted = data.captures || [];
     if (!inserted.length) {
-      showToast("未发现遗漏内容");
+      pending.resolve("未发现遗漏内容");
       return;
     }
     const newImgs = inserted.map((c) => ({
@@ -1868,9 +1888,9 @@ async function insertFromVideo(index) {
     state.images.splice(index + 1, 0, ...newImgs);
     await detectMeasuresFor(newImgs.map((c) => c.file));
     renderCardList();
-    showToast(`已插入 ${inserted.length} 张图片`, "success");
+    pending.resolve(`已插入 ${inserted.length} 张图片`, "success");
   } catch (e) {
-    showToast(e.message, "error");
+    pending.resolve(e.message, "error");
   } finally {
     state.inserting = false;
   }
@@ -1912,7 +1932,7 @@ async function uploadImageFile(fileOrBlob) {
 }
 
 async function uploadAndInsert(index, fileOrBlob) {
-  showToast("正在上传图片...");
+  const pending = showToast("正在上传图片...", "", { persist: true });
   try {
     const data = await uploadImageFile(fileOrBlob);
     const newImg = {
@@ -1929,16 +1949,16 @@ async function uploadAndInsert(index, fileOrBlob) {
     state.images.splice(index + 1, 0, newImg);
     await detectMeasuresFor([data.file]);
     renderCardList();
-    showToast("已插入图片", "success");
+    pending.resolve("已插入图片", "success");
   } catch (e) {
-    showToast(e.message, "error");
+    pending.resolve(e.message, "error");
   }
 }
 
 async function insertLocalFiles(index, files) {
   files = Array.from(files || []).filter(Boolean);
   if (!files.length) return;
-  showToast("正在上传图片...");
+  const pending = showToast("正在上传图片...", "", { persist: true });
   const inserted = [];
   try {
     for (let k = 0; k < files.length; k++) {
@@ -1958,15 +1978,15 @@ async function insertLocalFiles(index, files) {
     }
     await detectMeasuresFor(inserted);
     renderCardList();
-    showToast(`已插入 ${inserted.length} 张图片`, "success");
+    pending.resolve(`已插入 ${inserted.length} 张图片`, "success");
     closeInsertModal();
   } catch (e) {
-    showToast(e.message, "error");
+    pending.resolve(e.message, "error");
   }
 }
 
 async function replaceCardImage(index, file) {
-  showToast("正在替换图片...");
+  const pending = showToast("正在替换图片...", "", { persist: true });
   try {
     const fd = new FormData();
     fd.append("job_id", state.captureJobId);
@@ -1981,9 +2001,9 @@ async function replaceCardImage(index, file) {
     m.measures = [];
     await detectMeasuresFor([data.file]);
     renderCardList();
-    showToast("已替换图片", "success");
+    pending.resolve("已替换图片", "success");
   } catch (e) {
-    showToast(e.message, "error");
+    pending.resolve(e.message, "error");
   }
 }
 
@@ -2219,7 +2239,7 @@ async function splitCard(index, splitBtn, event) {
   const preview = splitBtn.closest(".card")?.querySelector(".card-preview");
   const rect = preview ? preview.getBoundingClientRect() : splitBtn.getBoundingClientRect();
   const ratio = clamp((event.clientY - rect.top) / rect.height, b.min, b.max);
-  showToast("正在分割...");
+  const pending = showToast("正在分割...", "", { persist: true });
   try {
     const data = await fetchJson("/api/split_image", {
       method: "POST",
@@ -2228,7 +2248,7 @@ async function splitCard(index, splitBtn, event) {
     });
     const parts = data.parts || [];
     if (parts.length !== 2) {
-      showToast("分割失败", "error");
+      pending.resolve("分割失败", "error");
       return;
     }
     const newCards = parts.map((p) => ({
@@ -2245,9 +2265,9 @@ async function splitCard(index, splitBtn, event) {
     state.images.splice(index, 1, ...newCards);
     await detectMeasuresFor([newCards[0].file, newCards[1].file]);
     renderCardList();
-    showToast("已分割为两张图片", "success");
+    pending.resolve("已分割为两张图片", "success");
   } catch (e) {
-    showToast(e.message, "error");
+    pending.resolve(e.message, "error");
   }
 }
 
@@ -2259,7 +2279,7 @@ async function mergeCardUpward(index) {
     showToast("没有上方图片可合并", "error");
     return;
   }
-  showToast("正在合并...");
+  const pending = showToast("正在合并...", "", { persist: true });
   try {
     const data = await fetchJson("/api/merge_image", {
       method: "POST",
@@ -2280,9 +2300,9 @@ async function mergeCardUpward(index) {
     state.images.splice(index - 1, 2, merged);
     await detectMeasuresFor([data.file]);
     renderCardList();
-    showToast("已合并到上方", "success");
+    pending.resolve("已合并到上方", "success");
   } catch (e) {
-    showToast(e.message, "error");
+    pending.resolve(e.message, "error");
   }
 }
 
@@ -2294,7 +2314,7 @@ async function mergeCardDownward(index) {
     showToast("没有下方图片可合并", "error");
     return;
   }
-  showToast("正在合并...");
+  const pending = showToast("正在合并...", "", { persist: true });
   try {
     const data = await fetchJson("/api/merge_image", {
       method: "POST",
@@ -2315,9 +2335,9 @@ async function mergeCardDownward(index) {
     state.images.splice(index, 2, merged);
     await detectMeasuresFor([data.file]);
     renderCardList();
-    showToast("已合并到下方", "success");
+    pending.resolve("已合并到下方", "success");
   } catch (e) {
-    showToast(e.message, "error");
+    pending.resolve(e.message, "error");
   }
 }
 
@@ -2347,10 +2367,12 @@ function clearOrDetect(index) {
     m.measures = [];
     syncCardList();
   } else {
-    showToast("正在识别……");
+    const pending = showToast("正在识别……", "", { persist: true });
     detectMeasuresFor([m.file]).then(() => {
       syncCardList();
-      showToast("已自动识别小节线", "success");
+      pending.resolve("已自动识别小节线", "success");
+    }).catch((e) => {
+      pending.resolve(e.message || "自动识别小节线失败。", "error");
     });
   }
 }
@@ -2987,12 +3009,12 @@ els.autoCropButton.addEventListener("click", async () => {
     showToast("已清空自动裁剪。");
     return;
   }
-  showToast("正在自动裁剪…");
+  const pending = showToast("正在自动裁剪…", "", { persist: true });
   try {
     await autoCrop();
-    showToast("已自动裁剪。", "success");
+    pending.resolve("已自动裁剪。", "success");
   } catch (e) {
-    showToast(e.message || "自动裁剪失败。", "error");
+    pending.resolve(e.message || "自动裁剪失败。", "error");
   }
 });
 els.autoMeasureButton.addEventListener("click", async () => {
@@ -3005,12 +3027,12 @@ els.autoMeasureButton.addEventListener("click", async () => {
     showToast("已清空小节线。");
     return;
   }
-  showToast("正在识别小节线…");
+  const pending = showToast("正在识别小节线…", "", { persist: true });
   try {
     await autoMeasures();
-    showToast("已自动识别小节线。", "success");
+    pending.resolve("已自动识别小节线。", "success");
   } catch (e) {
-    showToast(e.message || "自动识别小节线失败。", "error");
+    pending.resolve(e.message || "自动识别小节线失败。", "error");
   }
 });
 els.downloadPdfButton.addEventListener("click", downloadPdf);
