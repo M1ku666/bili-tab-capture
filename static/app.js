@@ -1215,6 +1215,89 @@ function renderCardList() {
   schedulePersist();
 }
 
+// 仅更新卡片动态内容（小节线、编号、裁剪视觉、按钮图标），不重建整个 DOM。
+// 大量截图时避免整体重建导致卡顿与滚动条跳动；排序/增删/分割/合并等结构变化
+// 会改变卡片顺序，检测到顺序不一致时自动退回整体重建。
+function syncCardList() {
+  numberMeasures();
+  const scrollY = window.scrollY;
+  const cards = [...els.cardList.querySelectorAll(".card")];
+  const currentOrder = cards.map((c) => c.dataset.file).join("");
+  const targetOrder = state.images.map((m) => m.file).join("");
+  if (currentOrder !== targetOrder) {
+    renderCardList();
+    return;
+  }
+  state.images.forEach((m, i) => {
+    const card = cards[i];
+    if (card) syncCardContent(card, m, i);
+  });
+  if (Math.abs(window.scrollY - scrollY) > 1) window.scrollTo(0, scrollY);
+  syncAutoDetectButtons();
+  syncSplitButtons();
+  schedulePersist();
+}
+
+function syncCardContent(card, m, i) {
+  card.dataset.index = String(i);
+  if (m.hidden) card.dataset.hidden = "true";
+  else delete card.dataset.hidden;
+
+  const preview = card.querySelector(".card-preview");
+  if (!preview) return;
+  preview.querySelectorAll(".measure-line").forEach((el) => el.remove());
+  (m.measureItems || []).forEach((it) => {
+    const line = document.createElement("div");
+    line.className = "measure-line";
+    line.dataset.x = String(it.x);
+    preview.appendChild(line);
+  });
+
+  const strip = card.querySelector(".card-measure-strip");
+  if (strip) {
+    strip.querySelectorAll(".measure-num").forEach((el) => el.remove());
+    const edge = strip.querySelector(".measure-edge");
+    if (edge) {
+      edge.dataset.x = String(m.crop.l);
+      edge.textContent = String(m.edgeLeftNum ?? "");
+    }
+    (m.measureItems || []).forEach((it) => {
+      const num = document.createElement("span");
+      num.className = "measure-num";
+      num.dataset.x = String(it.x);
+      if (it.num != null) {
+        num.innerHTML = `<span class="measure-num-label">${it.num}</span><span class="measure-x">×</span>`;
+      } else {
+        num.textContent = "×";
+        num.title = "删除此小节线";
+      }
+      num.addEventListener("click", (e) => {
+        e.stopPropagation();
+        deleteMeasure(i, it.x);
+      });
+      strip.appendChild(num);
+    });
+  }
+
+  applyCardCropVisual(card, m);
+
+  const hideBtn = card.querySelector('.card-btn[data-action="hide"]');
+  if (hideBtn) {
+    const title = m.hidden ? "显示" : "隐藏";
+    hideBtn.innerHTML = iconSvg(m.hidden ? "eyeOff" : "eye");
+    hideBtn.title = title;
+    hideBtn.setAttribute("aria-label", title);
+  }
+  const measureBtn = card.querySelector('.card-btn[data-action="clear"]');
+  if (measureBtn) {
+    const has = Boolean(m.measures && m.measures.length);
+    const title = has ? "清空小节线" : "自动识别小节线";
+    measureBtn.innerHTML = iconSvg(has ? "clear" : "magic");
+    measureBtn.title = title;
+    measureBtn.setAttribute("aria-label", title);
+  }
+}
+
 // 让「横向分割」按钮的高度跟随预览图（图片）高度。
 function syncSplitButtons() {
   if (!els.cardList) return;
@@ -1299,7 +1382,7 @@ async function autoCrop() {
     }
   });
 
-  renderCardList();
+  syncCardList();
 }
 
 // 自动小节：标记每张截图里的小节线（标记后排版可放大图片）。
@@ -1319,7 +1402,7 @@ async function autoMeasures() {
   state.images.forEach((m) => {
     m.measures = measures[m.file] || [];
   });
-  renderCardList();
+  syncCardList();
 }
 
 async function detectMeasuresFor(files) {
@@ -1459,6 +1542,7 @@ function buildCard(m, index) {
   const card = document.createElement("div");
   card.className = "card";
   card.dataset.index = String(index);
+  card.dataset.file = m.file;
   if (m.hidden) card.dataset.hidden = "true";
   if (m.flash) card.classList.add("is-flash");
 
@@ -1691,7 +1775,7 @@ function toggleHidden(index) {
   const m = state.images[index];
   if (!m) return;
   m.hidden = !m.hidden;
-  renderCardList();
+  syncCardList();
 }
 
 function openInsertModal(index) {
@@ -2101,7 +2185,7 @@ function dragCardCrop(event) {
 function endCardCrop() {
   if (!cardDrag) return;
   cardDrag = null;
-  renderCardList();
+  syncCardList();
 }
 
 /* —— 横向分割 —— */
@@ -2246,14 +2330,14 @@ function addMeasure(index, strip, event) {
   m.measures = m.measures || [];
   m.measures.push(p);
   m.measures.sort((a, b) => a - b);
-  renderCardList();
+  syncCardList();
 }
 
 function deleteMeasure(index, x) {
   const m = state.images[index];
   if (!m) return;
   m.measures = (m.measures || []).filter((mm) => Math.abs(mm - x) > 1e-6);
-  renderCardList();
+  syncCardList();
 }
 
 function clearOrDetect(index) {
@@ -2261,11 +2345,11 @@ function clearOrDetect(index) {
   if (!m) return;
   if (m.measures && m.measures.length) {
     m.measures = [];
-    renderCardList();
+    syncCardList();
   } else {
     showToast("正在识别……");
     detectMeasuresFor([m.file]).then(() => {
-      renderCardList();
+      syncCardList();
       showToast("已自动识别小节线", "success");
     });
   }
@@ -2899,7 +2983,7 @@ els.autoCropButton.addEventListener("click", async () => {
       m.crop.l = 0;
       m.crop.r = 1;
     });
-    renderCardList();
+    syncCardList();
     showToast("已清空自动裁剪。");
     return;
   }
@@ -2917,7 +3001,7 @@ els.autoMeasureButton.addEventListener("click", async () => {
     state.images.forEach((m) => {
       m.measures = [];
     });
-    renderCardList();
+    syncCardList();
     showToast("已清空小节线。");
     return;
   }
