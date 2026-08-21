@@ -70,6 +70,12 @@
       </form>
 
       <p class="status-line" id="importStatus"></p>
+      <div class="progress-wrap hidden" id="importProgressWrap">
+        <div class="progress-bar">
+          <div class="progress-fill" id="importProgressFill"></div>
+        </div>
+        <span class="progress-text" id="importProgressText">下载中…</span>
+      </div>
     </section>
 
     <section class="panel workspace hidden" id="workspace" aria-busy="false">
@@ -426,8 +432,8 @@
       </div>
       <div class="modal-body about-body">
         <p class="about-row"><span class="about-label">介绍视频</span><a href="https://www.bilibili.com/video/BV1KXgP6SEZ4" target="_blank" rel="noopener">BV1KXgP6SEZ4</a></p>
-        <p class="about-row"><span class="about-label">漏洞反馈</span><a href="https://space.bilibili.com/315868199" target="_blank" rel="noopener">@壳_sh311</a></p>
         <p class="about-row"><span class="about-label">版本记录</span><a href="https://gitee.com/m1ku666/bili-tab-capture/releases" target="_blank" rel="noopener">Releases</a></p>
+        <p class="about-row"><span class="about-label">漏洞反馈</span><span><a href="https://space.bilibili.com/315868199" target="_blank" rel="noopener">B站私信</a>  或  <a id="copyEmailLink" href="mailto:m1ku666@foxmail.com">复制邮箱</a></span></p>
       </div>
     </div>
   </div>

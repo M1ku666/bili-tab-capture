@@ -11,6 +11,9 @@ const state = {
   timelineDrag: null,
   pollTimer: null,
   importing: false,
+  downloading: false,
+  downloadPollTimer: null,
+  cacheKey: false, // source 是否有可持久化的缓存目录（bilibili / local）
   previewLoading: false,
   previewRequestId: 0,
   previewTime: null,
@@ -39,6 +42,9 @@ const els = {
   importForm: document.getElementById("importForm"),
   importButton: document.getElementById("importButton"),
   importStatus: document.getElementById("importStatus"),
+  importProgressWrap: document.getElementById("importProgressWrap"),
+  importProgressFill: document.getElementById("importProgressFill"),
+  importProgressText: document.getElementById("importProgressText"),
   workspace: document.getElementById("workspace"),
   bvidInput: document.getElementById("bvidInput"),
   bilibiliLoginButton: document.getElementById("bilibiliLoginButton"),
@@ -227,7 +233,14 @@ function setStage(n) {
   els.adjustPanel.classList.toggle("hidden", n !== 3);
   els.layoutPanel.classList.toggle("hidden", n !== 4);
   renderStepper();
-  if (n === 4) renderPages();
+  if (n === 2 && state.sourceId && state.previewTime === null && !state.previewLoading) {
+    // 进入截图步骤时，若尚未加载预览，默认显示视频时间中点的一帧。
+    loadPreview(state.initialPreviewTime);
+  }
+  if (n === 4) {
+    renderPages();
+    schedulePersist();
+  }
 }
 
 function renderStepper() {
@@ -306,6 +319,154 @@ function setImportLoading(isLoading) {
   els.importPanel.classList.toggle("is-loading", isLoading);
   els.importButton.textContent = isLoading ? "导入中..." : "导入";
   setControlBusy([els.importButton, els.bvidInput, els.bilibiliLoginButton, els.localFile], isLoading);
+}
+
+// 导入阶段的下载进度（不确定动画）。
+function setImportProgress(text) {
+  if (!els.importProgressWrap) return;
+  els.importProgressWrap.classList.remove("hidden");
+  els.importProgressFill.classList.remove("is-determinate");
+  els.importProgressFill.style.width = "";
+  els.importProgressText.textContent = text || "下载中…";
+}
+
+function hideImportProgress() {
+  if (els.importProgressWrap) els.importProgressWrap.classList.add("hidden");
+}
+
+// 轮询 B 站视频下载状态，完成后加载预览并进入截图页。
+async function pollDownload(sourceId) {
+  if (state.downloading) return;
+  state.downloading = true;
+  setImportProgress("下载中…");
+  try {
+    const result = await fetchJson(`/api/source/${sourceId}/download`);
+    if (sourceId !== state.sourceId) return;
+    if (result.status === "done") {
+      hideImportProgress();
+      setStatus(els.importStatus, "已导入。", "success");
+      state.maxStage = 2;
+      setStage(2);
+      return;
+    }
+    if (result.status === "error") {
+      hideImportProgress();
+      setStatus(els.importStatus, result.message || "下载失败。", "error");
+      return;
+    }
+    state.downloadPollTimer = setTimeout(() => pollDownload(sourceId), 1000);
+  } catch (error) {
+    hideImportProgress();
+    setStatus(els.importStatus, error.message, "error");
+  } finally {
+    state.downloading = false;
+  }
+}
+
+function serializeImages() {
+  return state.images.map((m) => ({
+    file: m.file,
+    t: m.t ?? 0,
+    w: m.w,
+    h: m.h,
+    hidden: !!m.hidden,
+    crop: { l: m.crop.l, r: m.crop.r, t: m.crop.t ?? 0, b: m.crop.b ?? 1 },
+    measures: m.measures || [],
+  }));
+}
+
+// 序列化第四步排版参数，随缓存一起持久化以便恢复。
+function serializeLayout() {
+  return {
+    title: els.titleArea.value || "",
+    scale: els.scaleInput.value || "1",
+    margin: els.pageMargin.value || "40",
+    spacing: els.imageSpacing.value || "25",
+    titleSpacing: els.titleSpacing.value || "130",
+    bgColor: els.bgColor.value || "#ffffff",
+    textColor: els.textColor.value || "#181818",
+    orientation: currentOrientation(),
+    align: currentAlign(),
+    valign: currentValign(),
+    previewCols: currentPreviewCols(),
+    invert: !!els.invertInput.checked,
+    recolor: !!(els.recolorInput && els.recolorInput.checked),
+  };
+}
+
+// 每张图片可变更字段的签名，用于 diff 增量持久化。
+function imageSignature(m) {
+  return JSON.stringify({
+    hidden: !!m.hidden,
+    crop: { l: m.crop.l, r: m.crop.r, t: m.crop.t ?? 0, b: m.crop.b ?? 1 },
+    measures: m.measures || [],
+  });
+}
+
+// 上一次持久化到后端的快照（按 file 存签名），用于只发送变更部分。
+let persistSnapshot = null;
+
+// 持久化调整状态：只把「改了什么」发给后端，避免整表反复序列化导致卡顿。
+function persistStateNow() {
+  if (!state.cacheKey || !state.captureJobId) return;
+  const images = state.images;
+  const layout = serializeLayout();
+  const maxStage = state.maxStage;
+  const body = { job_id: state.captureJobId };
+
+  if (!persistSnapshot) {
+    // 首次保存：发送完整列表。
+    body.images = serializeImages();
+    body.layout = layout;
+    body.maxStage = maxStage;
+  } else {
+    const oldSigs = persistSnapshot.images;
+    const newFiles = new Set(images.map((m) => m.file));
+    const removed = [...oldSigs.keys()].some((f) => !newFiles.has(f));
+    const added = images.some((m) => !oldSigs.has(m.file));
+
+    const patches = [];
+    for (const m of images) {
+      if (!oldSigs.has(m.file)) continue;
+      if (oldSigs.get(m.file) !== imageSignature(m)) {
+        patches.push({
+          file: m.file,
+          hidden: !!m.hidden,
+          crop: { l: m.crop.l, r: m.crop.r, t: m.crop.t ?? 0, b: m.crop.b ?? 1 },
+          measures: m.measures || [],
+        });
+      }
+    }
+
+    if (removed || added || patches.length > 1) {
+      body.images = serializeImages();
+    } else if (patches.length === 1) {
+      body.image = patches[0];
+    }
+
+    if (persistSnapshot.layout !== JSON.stringify(layout)) body.layout = layout;
+    if (persistSnapshot.maxStage !== maxStage) body.maxStage = maxStage;
+  }
+
+  fetchJson("/api/save_state", {
+    method: "POST",
+    headers: JSON_HEADERS,
+    body: JSON.stringify(body),
+    keepalive: true,
+  }).then(() => {
+    persistSnapshot = {
+      images: new Map(images.map((m) => [m.file, imageSignature(m)])),
+      layout: JSON.stringify(layout),
+      maxStage,
+    };
+  }).catch(() => {});
+}
+
+let persistTimer = null;
+function schedulePersist() {
+  if (!state.cacheKey) return;
+  if (persistTimer) clearTimeout(persistTimer);
+  persistTimer = setTimeout(persistStateNow, 800);
 }
 
 function setPreviewLoading(isLoading, message = "更新预览中...", mode = "") {
@@ -567,8 +728,16 @@ function applySource(source) {
   clearStatuses();
   state.images = [];
   state.captureJobId = null;
+  persistSnapshot = null;
+  if (state.downloadPollTimer) {
+    clearTimeout(state.downloadPollTimer);
+    state.downloadPollTimer = null;
+  }
+  state.downloading = false;
+  hideImportProgress();
 
   state.sourceId = source.id;
+  state.cacheKey = !!source.cache_dir;
   state.duration = source.duration || null;
   state.sourceType = source.type === "image" ? "image" : "video";
   const metadata = source.metadata || {};
@@ -577,8 +746,6 @@ function applySource(source) {
   state.sourceUrl = metadata.source_url || "";
   // URL 导入自动识别的标题/作者直接分两行放入文本域；本地图片/视频只有标题。
   els.titleArea.value = channel ? `${title}\n${channel}` : title;
-  state.maxStage = 2;
-  setStage(2);
 
   const isImage = state.sourceType === "image";
   els.timeline.classList.toggle("hidden", isImage);
@@ -597,6 +764,29 @@ function applySource(source) {
 
   updateCropUi();
   updateTimeline();
+
+  // 命中缓存：直接恢复截图、调整状态与排版参数；若已保存过排版则直接跳到第四步。
+  if (source.restore) {
+    state.captureJobId = source.restore.job_id;
+    restoreCards(source.restore.images);
+    restoreLayout(source.restore.layout);
+    const targetStage = source.restore.maxStage === 4 ? 4 : 3;
+    state.maxStage = Math.max(3, targetStage);
+    setStage(targetStage);
+    setStatus(els.importStatus, "已从缓存恢复。", "success");
+    return;
+  }
+
+  // B 站视频在导入时即开始下载：停留在导入页显示进度，下载完成后再进入截图页。
+  if (source.download && source.download.status === "downloading") {
+    state.maxStage = 1;
+    setStage(1);
+    pollDownload(source.id);
+    return;
+  }
+
+  state.maxStage = 2;
+  setStage(2);
 }
 
 async function loadPreview(timeValue) {
@@ -832,21 +1022,18 @@ function step3Src(m) {
   return `/api/capture_preview/${state.captureJobId}/${m.file}?${params.toString()}`;
 }
 
-// 第四步条带预览：去色→染成文字/背景色→(可选)反色。
+// 第四步条带预览：去色（音符黑/背景白）→(可选)反色。
 function step4Src(m) {
   const recolor = els.recolorInput && els.recolorInput.checked;
   const invert = els.invertInput.checked;
   if (!recolor && !invert) return m.url;
   const params = new URLSearchParams();
   params.set("invert", invert ? "1" : "0");
-  params.set("binarize", recolor ? "1" : "0");
   if (recolor) {
+    params.set("binarize", "1");
     params.set("note_color", els.noteColor.value || "#000000");
     params.set("tolerance", els.tolerance.value);
     params.set("softness", els.softness.value);
-    params.set("recolor", "1");
-    params.set("text_color", els.textColor.value || "#181818");
-    params.set("bg_color", els.bgColor.value || "#ffffff");
   }
   return `/api/capture_preview/${state.captureJobId}/${m.file}?${params.toString()}`;
 }
@@ -969,6 +1156,50 @@ function renderCards(images) {
   renderCardList();
 }
 
+// 从缓存恢复：保留隐藏、裁剪、小节线等调整状态，url 用当前 job_id 重建。
+function restoreCards(images) {
+  state.images = (images || []).map((m) => ({
+    file: m.file,
+    url: `/api/captures/${state.captureJobId}/${m.file}`,
+    t: m.t ?? 0,
+    w: m.w,
+    h: m.h,
+    hidden: !!m.hidden,
+    flash: false,
+    crop: { l: m.crop?.l ?? 0, r: m.crop?.r ?? 1, t: m.crop?.t ?? 0, b: m.crop?.b ?? 1 },
+    measures: m.measures || [],
+  }));
+  renderCardList();
+}
+
+// 从缓存恢复第四步排版参数。
+function restoreLayout(layout) {
+  if (!layout) return;
+  const setVal = (input, slider, value) => {
+    if (input) input.value = value;
+    if (slider) slider.value = value;
+  };
+  if (layout.title != null) els.titleArea.value = layout.title;
+  setVal(els.scaleInput, els.scaleSlider, layout.scale);
+  setVal(els.pageMargin, els.marginSlider, layout.margin);
+  setVal(els.imageSpacing, els.spacingSlider, layout.spacing);
+  setVal(els.titleSpacing, els.titleSpacingSlider, layout.titleSpacing);
+  setVal(els.bgColor, els.bgColorHex, layout.bgColor);
+  setVal(els.textColor, els.textColorHex, layout.textColor);
+  const setRadio = (name, value) => {
+    if (value == null) return;
+    const radio = document.querySelector(`input[name="${name}"][value="${value}"]`);
+    if (radio) radio.checked = true;
+  };
+  setRadio("orientation", layout.orientation);
+  setRadio("align", layout.align);
+  setRadio("valign", layout.valign);
+  setRadio("previewCols", String(layout.previewCols));
+  if (layout.invert != null) els.invertInput.checked = !!layout.invert;
+  if (els.recolorInput && layout.recolor != null) els.recolorInput.checked = !!layout.recolor;
+  syncRecolorOption();
+}
+
 function renderCardList() {
   numberMeasures();
   const scrollY = window.scrollY;
@@ -981,6 +1212,7 @@ function renderCardList() {
   if (Math.abs(window.scrollY - scrollY) > 1) window.scrollTo(0, scrollY);
   syncAutoDetectButtons();
   syncSplitButtons();
+  schedulePersist();
 }
 
 // 让「横向分割」按钮的高度跟随预览图（图片）高度。
@@ -1251,6 +1483,8 @@ function buildCard(m, index) {
   img.src = step3Src(m);
   img.alt = "";
   img.draggable = false;
+  // 用已知宽高锁定宽高比，图片加载前即占位，避免列表重建时高度抖动导致滚动条跳动。
+  if (m.w && m.h) img.style.aspectRatio = `${m.w} / ${m.h}`;
   preview.appendChild(img);
 
   (m.measureItems || []).forEach((it) => {
@@ -2406,8 +2640,10 @@ els.importForm.addEventListener("submit", async (event) => {
       body: formData,
     });
     applySource(source);
-    setStatus(els.importStatus, "已导入。", "success");
-    await loadPreview(state.initialPreviewTime);
+    const needPreview = !source.restore && !(source.download && source.download.status === "downloading");
+    if (needPreview) {
+      setStatus(els.importStatus, "已导入。", "success");
+    }
   } catch (error) {
     setStatus(els.importStatus, error.message, "error");
   } finally {
@@ -2886,6 +3122,21 @@ els.infoModal.addEventListener("click", (e) => {
   if (e.target === els.infoModal) els.infoModal.classList.add("hidden");
 });
 
+// 「复制邮箱」：复制到剪贴板并给出提示。
+const copyEmailLink = document.getElementById("copyEmailLink");
+if (copyEmailLink) {
+  copyEmailLink.addEventListener("click", async (e) => {
+    e.preventDefault();
+    const email = "m1ku666@foxmail.com";
+    try {
+      await navigator.clipboard.writeText(email);
+      showToast(`已复制 ${email}`, "success");
+    } catch (err) {
+      showToast("复制失败：" + err.message, "error");
+    }
+  });
+}
+
 // 更新弹窗。
 els.updateModalClose.addEventListener("click", () => els.updateModal.classList.add("hidden"));
 els.updateModal.addEventListener("click", (e) => {
@@ -2953,6 +3204,32 @@ document.querySelectorAll('input[name="valign"]').forEach((radio) => {
 document.querySelectorAll('input[name="previewCols"]').forEach((radio) => {
   radio.addEventListener("change", renderPages);
 });
+// 排版参数变化时同步持久化（用于缓存恢复）。
+const layoutPersistTargets = [
+  els.titleArea,
+  els.pageMargin,
+  els.imageSpacing,
+  els.titleSpacing,
+  els.scaleInput,
+  els.scaleSlider,
+  els.marginSlider,
+  els.spacingSlider,
+  els.titleSpacingSlider,
+  els.bgColor,
+  els.bgColorHex,
+  els.textColor,
+  els.textColorHex,
+  els.invertInput,
+  els.recolorInput,
+];
+layoutPersistTargets.forEach((input) => {
+  if (!input) return;
+  input.addEventListener("input", schedulePersist);
+  input.addEventListener("change", schedulePersist);
+});
+document.querySelectorAll('input[name="orientation"], input[name="align"], input[name="valign"], input[name="previewCols"]').forEach((radio) => {
+  radio.addEventListener("change", schedulePersist);
+});
 syncRecolorOption();
 updateCleanSummary();
 
@@ -3014,3 +3291,9 @@ fetchJson("/api/bilibili/login")
     }
   })
   .catch(() => { });
+
+// 关闭/刷新前立即持久化一次调整状态（keepalive 保证请求能发出）。
+window.addEventListener("beforeunload", () => {
+  if (persistTimer) clearTimeout(persistTimer);
+  persistStateNow();
+});

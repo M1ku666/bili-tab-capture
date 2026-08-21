@@ -43,6 +43,7 @@ HEADER_LINE_HEIGHT_RATIO = 1.2  # 标题/作者行高 = 字号 × 该比例（�
 from runtime_paths import ensure_bilix
 
 BILIX_EXE = ensure_bilix()
+BILIX_ENV = {**os.environ, "PYTHONIOENCODING": "utf-8", "PYTHONUTF8": "1"}
 VIDEO_FILE_EXTENSIONS = (".mp4", ".mkv", ".webm", ".mov")
 BILIBILI_USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -369,6 +370,7 @@ def download_bilibili_video(
         command,
         capture_output=True,
         cwd=str(BILIX_EXE.parent),
+        env=BILIX_ENV,
     )
     stdout = decode_bytes(completed.stdout)
     stderr = decode_bytes(completed.stderr)

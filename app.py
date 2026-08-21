@@ -1,7 +1,9 @@
 import contextlib
+import hashlib
 import io
 import json
 import re
+import shutil
 import subprocess
 import tempfile
 import threading
@@ -15,10 +17,11 @@ from typing import Any, Dict, List, Optional, Tuple
 from runtime_paths import data_dir, resource_dir
 from flask import Flask, jsonify, render_template, request, send_file, send_from_directory
 from werkzeug.utils import secure_filename
-from PIL import Image, ImageColor, ImageOps
+from PIL import Image, ImageOps
 
 from tab_extractor import (
     BILIX_EXE,
+    BILIX_ENV,
     ExtractionOptions,
     ExtractionStats,
     RESAMPLE,
@@ -31,6 +34,7 @@ from tab_extractor import (
     detect_measure_barlines,
     download_bilibili_video,
     download_video,
+    extract_bilibili_id,
     extract_note_mask,
     extract_unique_crops,
     find_video_file,
@@ -40,7 +44,6 @@ from tab_extractor import (
     preprocess_for_detection,
     probe_bilibili_metadata,
     probe_youtube_metadata,
-    recolor_gray,
     save_video_frame,
     split_into_measures,
     validate_crop_ratios,
@@ -53,6 +56,49 @@ CACHE_DIR = ROOT_DIR / "BiliTabCapture_cache"
 UPLOADS_DIR = CACHE_DIR / "uploads"
 PREVIEWS_DIR = CACHE_DIR / "previews"
 RUNS_DIR = CACHE_DIR / "runs"
+
+
+def hash_file(path: Path, chunk_size: int = 1 << 20) -> str:
+    """SHA-256 of a file's content, used as the local-video cache key."""
+    digest = hashlib.sha256()
+    with open(path, "rb") as fh:
+        for chunk in iter(lambda: fh.read(chunk_size), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def bilibili_cache_dir(bvid: str) -> Path:
+    return CACHE_DIR / "bv" / bvid
+
+
+def local_cache_dir(file_hash: str) -> Path:
+    return CACHE_DIR / "local" / file_hash
+
+
+def load_state_json(cache_dir: Path) -> Optional[Dict[str, Any]]:
+    p = cache_dir / "state.json"
+    if not p.exists():
+        return None
+    try:
+        return json.loads(p.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+
+
+def save_state_json(cache_dir: Path, data: Dict[str, Any]) -> None:
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    (cache_dir / "state.json").write_text(
+        json.dumps(data, ensure_ascii=False), encoding="utf-8"
+    )
+
+
+def job_crops_dir(job_id: str) -> Path:
+    """Crops dir for a job: cache-keyed sources persist under the cache dir."""
+    with STORE_LOCK:
+        job = JOBS.get(job_id)
+    if job and job.get("crops_dir"):
+        return Path(job["crops_dir"])
+    return RUNS_DIR / job_id / "crops"
 
 
 def current_version() -> str:
@@ -105,6 +151,7 @@ def run_bilibili_login_worker(token: str) -> None:
             cwd=cwd,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
+            env=BILIX_ENV,
         )
     except Exception as exc:
         with BILIBILI_LOGIN_LOCK:
@@ -339,10 +386,18 @@ def run_capture_job(job_id: str, payload: Dict[str, Any]) -> None:
             )
 
             run_dir = RUNS_DIR / job_id
-            download_dir = run_dir / "download"
-            crops_dir = run_dir / "crops"
-            comparison_dir = run_dir / "comparison" if options.debug_diffs else None
-            run_dir.mkdir(parents=True, exist_ok=True)
+            cache_dir = Path(source["cache_dir"]) if source.get("cache_dir") else None
+            if cache_dir is not None:
+                # Cache-keyed sources (bilibili / local): persist crops under the cache dir.
+                download_dir = cache_dir
+                crops_dir = cache_dir / "crops"
+                comparison_dir = cache_dir / "comparison" if options.debug_diffs else None
+                crops_dir.mkdir(parents=True, exist_ok=True)
+            else:
+                download_dir = run_dir / "download"
+                crops_dir = run_dir / "crops"
+                comparison_dir = run_dir / "comparison" if options.debug_diffs else None
+                run_dir.mkdir(parents=True, exist_ok=True)
 
             update_job(job_id, status="running", phase="downloading", updated_at=time.time())
 
@@ -363,8 +418,10 @@ def run_capture_job(job_id: str, payload: Dict[str, Any]) -> None:
                     channel_override=payload.get("channel"),
                 )
             elif source["type"] == "bilibili":
-                print("正在下载 Bilibili 视频...")
-                video_path = download_bilibili_video(source["url"], download_dir)
+                video_path = Path(source.get("video_path") or "")
+                if not video_path.exists():
+                    print("正在下载 Bilibili 视频...")
+                    video_path = download_bilibili_video(source["url"], download_dir)
                 downloaded_start_sec = 0.0
                 metadata = build_video_metadata(
                     raw_title=source_metadata.raw_title,
@@ -467,6 +524,20 @@ def run_capture_job(job_id: str, payload: Dict[str, Any]) -> None:
                 metadata=metadata_to_dict(metadata),
                 updated_at=time.time(),
             )
+            if cache_dir is not None:
+                update_job(
+                    job_id,
+                    crops_dir=str(crops_dir),
+                    cache_dir=str(cache_dir),
+                )
+                save_state_json(
+                    cache_dir,
+                    {
+                        "captures": captures,
+                        "capture_params": capture_params,
+                        "metadata": metadata_to_dict(metadata),
+                    },
+                )
             print(f"已生成 {len(captures)} 张截图。")
         except Exception as exc:
             update_job(
@@ -570,6 +641,71 @@ def api_set_skipped_version():
     return jsonify({"ok": True})
 
 
+def run_bilibili_download(source_id: str, url: str, cache_dir: Path, bvid: str) -> None:
+    """Background Bilibili download started at import time."""
+    try:
+        path = download_bilibili_video(url, cache_dir)
+        # 统一重命名为 BVxxxx.mp4，避免 bilix 用视频标题（可能含中文/特殊字符）作文件名。
+        target = cache_dir / f"{bvid}.mp4"
+        if path.resolve() != target.resolve():
+            shutil.move(str(path), str(target))
+        path = target
+        with STORE_LOCK:
+            src = SOURCES.get(source_id)
+            if src:
+                src["video_path"] = str(path)
+                src["download"] = {"status": "done", "message": None}
+    except Exception as exc:
+        with STORE_LOCK:
+            src = SOURCES.get(source_id)
+            if src:
+                src["download"] = {"status": "error", "message": str(exc)}
+
+
+def make_cached_job(source_id: str, cache_dir: Path, state: Dict[str, Any]) -> str:
+    """Create a done job from persisted cache state; returns the job_id."""
+    job_id = uuid.uuid4().hex
+    captures = state.get("captures") or []
+    with STORE_LOCK:
+        JOBS[job_id] = {
+            "id": job_id,
+            "source_id": source_id,
+            "status": "done",
+            "phase": "done",
+            "logs": ["已从缓存恢复。"],
+            "stats": {"captures_kept": len(captures)},
+            "captures": captures,
+            "metadata": state.get("metadata"),
+            "error": None,
+            "pdf_url": None,
+            "crops_dir": str(cache_dir / "crops"),
+            "cache_dir": str(cache_dir),
+            "capture_params": state.get("capture_params") or {},
+            "created_at": time.time(),
+            "updated_at": time.time(),
+        }
+    return job_id
+
+
+def restore_images(state: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Reconstruct the frontend images array from persisted state."""
+    images = state.get("images")
+    if images is not None:
+        return images
+    return [
+        {
+            "file": c.get("file"),
+            "t": c.get("t", 0),
+            "w": c.get("w"),
+            "h": c.get("h"),
+            "hidden": False,
+            "crop": {"l": 0, "r": 1, "t": 0, "b": 1},
+            "measures": [],
+        }
+        for c in (state.get("captures") or [])
+    ]
+
+
 @app.post("/api/import")
 def import_source():
     ensure_cache_dirs()
@@ -582,13 +718,35 @@ def import_source():
             full_url = normalize_bilibili_url(bvid)
             metadata, duration = probe_bilibili_metadata(full_url)
             source_id = uuid.uuid4().hex
+            bvid_id, aid = extract_bilibili_id(full_url)
+            cache_dir = bilibili_cache_dir(bvid_id or f"av{aid}")
             source = {
                 "id": source_id,
                 "type": "bilibili",
                 "url": full_url,
                 "metadata": metadata_to_dict(metadata),
                 "duration": duration,
+                "cache_dir": str(cache_dir),
+                "download": {"status": "idle", "message": None},
             }
+            state = load_state_json(cache_dir)
+            cached_video = find_video_file(cache_dir)
+            if state is not None and state.get("captures"):
+                job_id = make_cached_job(source_id, cache_dir, state)
+                source["restore"] = {"job_id": job_id, "images": restore_images(state), "layout": state.get("layout"), "maxStage": state.get("maxStage")}
+                source["download"]["status"] = "done"
+                if cached_video is not None:
+                    source["video_path"] = str(cached_video)
+            elif cached_video is not None:
+                source["video_path"] = str(cached_video)
+                source["download"]["status"] = "done"
+            else:
+                source["download"]["status"] = "downloading"
+                threading.Thread(
+                    target=run_bilibili_download,
+                    args=(source_id, full_url, cache_dir, bvid_id or f"av{aid}"),
+                    daemon=True,
+                ).start()
         elif youtube_url:
             if not is_youtube_url(youtube_url):
                 return json_error("请输入有效的 YouTube 链接。")
@@ -621,13 +779,28 @@ def import_source():
             elif suffix in ALLOWED_VIDEO_EXTENSIONS:
                 duration = get_video_duration(saved_path)
                 metadata = build_video_metadata(raw_title=Path(original_name).stem)
+                file_hash = hash_file(saved_path)
+                cache_dir = local_cache_dir(file_hash)
+                cache_dir.mkdir(parents=True, exist_ok=True)
+                cached_video = cache_dir / f"video{suffix}"
+                if cached_video.exists():
+                    saved_path.unlink(missing_ok=True)
+                else:
+                    shutil.move(str(saved_path), str(cached_video))
                 source = {
                     "id": source_id,
                     "type": "local",
-                    "path": str(saved_path),
+                    "path": str(cached_video),
                     "metadata": metadata_to_dict(metadata),
                     "duration": duration,
+                    "cache_dir": str(cache_dir),
+                    "download": {"status": "done", "message": None},
+                    "video_path": str(cached_video),
                 }
+                state = load_state_json(cache_dir)
+                if state is not None and state.get("captures"):
+                    job_id = make_cached_job(source_id, cache_dir, state)
+                    source["restore"] = {"job_id": job_id, "images": restore_images(state), "layout": state.get("layout"), "maxStage": state.get("maxStage")}
             else:
                 return json_error("不支持的文件格式，请使用视频（mp4/mov/mkv/webm）或图片（png/jpg/webp/bmp/gif）。")
         else:
@@ -639,6 +812,57 @@ def import_source():
         return jsonify(source)
     except ValueError as exc:
         return json_error(str(exc), 400)
+    except Exception as exc:
+        return json_error(str(exc), 500)
+
+
+@app.get("/api/source/<source_id>/download")
+def source_download_status(source_id: str):
+    with STORE_LOCK:
+        source = SOURCES.get(source_id)
+    if source is None:
+        return json_error("未知的视频源。", 404)
+    return jsonify(source.get("download") or {"status": "idle", "message": None})
+
+
+@app.post("/api/save_state")
+def save_state():
+    """Persist the frontend adjustment state (images) into the job's cache dir."""
+    payload = request.get_json(force=True, silent=True) or {}
+    try:
+        job_id = payload.get("job_id")
+        with STORE_LOCK:
+            job = JOBS.get(job_id)
+        if job is None:
+            return json_error("未知的任务。", 404)
+        cache_dir_str = job.get("cache_dir")
+        if not cache_dir_str:
+            return json_error("该任务没有缓存目录。", 409)
+        cache_dir = Path(cache_dir_str)
+        state = load_state_json(cache_dir) or {}
+        state.setdefault("images", [])
+        if payload.get("images") is not None:
+            # 完整列表（结构性变更：分割/合并/插入/排序/删除等）。
+            state["images"] = payload["images"]
+        elif payload.get("image") is not None:
+            # 单张图片的增量补丁（裁剪/小节线/隐藏）。
+            patch = payload["image"]
+            target = next((img for img in state["images"] if img.get("file") == patch.get("file")), None)
+            if target is None:
+                state["images"].append(patch)
+            else:
+                if "crop" in patch:
+                    target["crop"] = patch["crop"]
+                if "measures" in patch:
+                    target["measures"] = patch["measures"]
+                if "hidden" in patch:
+                    target["hidden"] = patch["hidden"]
+        if payload.get("layout") is not None:
+            state["layout"] = payload["layout"]
+        if payload.get("maxStage") is not None:
+            state["maxStage"] = payload["maxStage"]
+        save_state_json(cache_dir, state)
+        return jsonify({"ok": True})
     except Exception as exc:
         return json_error(str(exc), 500)
 
@@ -710,8 +934,15 @@ def preview_source():
         preview_name = f"{source['id']}_{int(time_sec * 1000)}_{uuid.uuid4().hex[:8]}.jpg"
         preview_path = PREVIEWS_DIR / preview_name
 
-        if source["type"] in ("youtube", "bilibili"):
+        if source["type"] == "youtube":
             video_path = cached_remote_preview_video(source)
+            save_video_frame(video_path, preview_path, time_sec=time_sec)
+        elif source["type"] == "bilibili":
+            cached = Path(source.get("video_path") or "")
+            if cached.exists():
+                video_path = cached
+            else:
+                video_path = cached_remote_preview_video(source)
             save_video_frame(video_path, preview_path, time_sec=time_sec)
         else:
             save_video_frame(Path(source["path"]), preview_path, time_sec=time_sec)
@@ -775,7 +1006,7 @@ def start_captures():
 
 @app.get("/api/captures/<job_id>/<path:filename>")
 def capture_file(job_id: str, filename: str):
-    return send_from_directory(RUNS_DIR / job_id / "crops", filename, as_attachment=False)
+    return send_from_directory(job_crops_dir(job_id), filename, as_attachment=False)
 
 
 @app.get("/api/capture_preview/<job_id>/<path:filename>")
@@ -784,32 +1015,22 @@ def capture_preview(job_id: str, filename: str):
 
     流程：原图 → (可选)按音符颜色二值化 → (可选)染色为文字/背景色 → (可选)反色。
     """
-    crops_dir = RUNS_DIR / job_id / "crops"
+    crops_dir = job_crops_dir(job_id)
     src = crops_dir / filename
     if not src.exists():
         return json_error("未知的截图。", 404)
 
     invert = parse_bool(request.args.get("invert"))
     binarize = parse_bool(request.args.get("binarize"))
-    recolor = parse_bool(request.args.get("recolor"))
 
     note_rgb = parse_optional_note_color(request.args.get("note_color"))
     tolerance = parse_float(request.args.get("tolerance"), "tolerance", 60.0)
     softness = parse_float(request.args.get("softness"), "softness", 20.0)
 
-    text_color = parse_hex_color(request.args.get("text_color"), "#181818")
-    bg_color = (request.args.get("bg_color") or "white").strip()
-    if not re.fullmatch(r"#[0-9a-fA-F]{6}|[a-zA-Z]+", bg_color):
-        bg_color = "white"
-
     try:
         img = Image.open(src).convert("RGB")
         if binarize and note_rgb is not None:
-            mask = extract_note_mask(img, note_rgb, tolerance, softness)
-            if recolor:
-                img = recolor_gray(mask, hex_to_rgb(text_color), ImageColor.getrgb(bg_color))
-            else:
-                img = mask.convert("RGB")
+            img = extract_note_mask(img, note_rgb, tolerance, softness).convert("RGB")
         if invert:
             img = ImageOps.invert(img)
         buf = io.BytesIO()
@@ -872,7 +1093,7 @@ def prepare_final_strips(
 
     返回 (final_dir, strip_count)。
     """
-    crops_dir = RUNS_DIR / job_id / "crops"
+    crops_dir = job_crops_dir(job_id)
     final_dir = RUNS_DIR / job_id / "final"
     final_dir.mkdir(parents=True, exist_ok=True)
     for old in final_dir.glob("*.png"):
@@ -907,12 +1128,7 @@ def prepare_final_strips(
                 nh = max(1, int(round(strip.height * scale)))
                 strip = strip.resize((nw, nh), RESAMPLE)
             if opts["binarize"] and opts["note_rgb"] is not None:
-                mask = extract_note_mask(strip, opts["note_rgb"], opts["tolerance"], opts["softness"])
-                strip = recolor_gray(
-                    mask,
-                    hex_to_rgb(opts["text_color"]),
-                    ImageColor.getrgb(opts["bg_color"]),
-                )
+                strip = extract_note_mask(strip, opts["note_rgb"], opts["tolerance"], opts["softness"]).convert("RGB")
             if opts["invert"]:
                 strip = ImageOps.invert(strip)
             strip.save(final_dir / f"final_{index:04d}.png")
@@ -1020,7 +1236,7 @@ def detect_measures():
             job = JOBS.get(job_id)
         if job is None:
             return json_error("未知的任务。", 404)
-        crops_dir = RUNS_DIR / job_id / "crops"
+        crops_dir = job_crops_dir(job_id)
         files = payload.get("files") or []
         coefficient_horizontal = parse_float(
             payload.get("coefficient_horizontal"), "coefficient_horizontal", 0.7
@@ -1060,7 +1276,7 @@ def stitch_offsets():
             job = JOBS.get(job_id)
         if job is None:
             return json_error("未知的任务。", 404)
-        crops_dir = RUNS_DIR / job_id / "crops"
+        crops_dir = job_crops_dir(job_id)
         files = payload.get("files") or []
         coefficient_horizontal = parse_float(
             payload.get("coefficient_horizontal"), "coefficient_horizontal", 0.7
@@ -1118,7 +1334,7 @@ def import_image():
         suffix = Path(original_name).suffix.lower()
         if suffix not in ALLOWED_IMAGE_EXTENSIONS:
             return json_error("不支持的图片格式。")
-        crops_dir = RUNS_DIR / job_id / "crops"
+        crops_dir = job_crops_dir(job_id)
         crops_dir.mkdir(parents=True, exist_ok=True)
         out_name = f"img_{uuid.uuid4().hex[:10]}{suffix}"
         upload.save(crops_dir / out_name)
@@ -1164,7 +1380,7 @@ def insert_captures():
         if end <= start:
             return jsonify({"captures": []})
 
-        crops_dir = RUNS_DIR / job_id / "crops"
+        crops_dir = job_crops_dir(job_id)
         crops_dir.mkdir(parents=True, exist_ok=True)
 
         band_half_width = int(capture_params.get("band_half_width", 90))
@@ -1257,7 +1473,7 @@ def split_image():
             job = JOBS.get(job_id)
         if job is None:
             return json_error("未知的任务。", 404)
-        crops_dir = RUNS_DIR / job_id / "crops"
+        crops_dir = job_crops_dir(job_id)
         src = crops_dir / payload.get("file", "")
         if not src.exists():
             return json_error("未知的截图。", 404)
@@ -1297,7 +1513,7 @@ def merge_image():
             job = JOBS.get(job_id)
         if job is None:
             return json_error("未知的任务。", 404)
-        crops_dir = RUNS_DIR / job_id / "crops"
+        crops_dir = job_crops_dir(job_id)
         top_path = crops_dir / payload.get("top", "")
         bottom_path = crops_dir / payload.get("bottom", "")
         if not top_path.exists() or not bottom_path.exists():
