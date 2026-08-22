@@ -41,7 +41,7 @@
 ## 致谢
 
 - [santiRostan/TabCapture](https://github.com/santiRostan/TabCapture) 项目框架及截图算法
-- [Koril33/bilix](https://github.com/Koril33/bilix) 哔哩哔哩视频下载
+- [Koril33/bilix](https://github.com/Koril33/bilix) 哔哩哔哩视频下载，有部分改动，详见[m1ku666/bilix](https://gitee.com/m1ku666/bilix)
 - [Carrot-shreds/score_capture](https://github.com/Carrot-shreds/score_capture) 自动识别小节线及裁剪去重
 
 ## 配置
