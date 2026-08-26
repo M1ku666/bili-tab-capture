@@ -46,6 +46,46 @@
 
 ## 配置
 
-环境配置请参照[TabCapture](https://github.com/santiRostan/TabCapture)
+需要 **Python >= 3.10**（requirements.txt 中的 yt-dlp 固定安装自 GitHub master 分支，
+以避免 PyPI 正式版更新滞后于 YouTube 改动导致下载失败，而该分支要求 Python >= 3.10）。
 
-打包exe请运行build_exe.bat，产物在 dist/BiliTabCapture.exe
+### Windows
+
+打包好的 `BiliTabCapture.exe` 双击即可运行，无需安装 Python。自行打包请运行
+`build_exe.bat`，产物在 `dist/BiliTabCapture.exe`。
+
+从源码运行：
+
+```bash
+python -m venv .venv
+.venv\Scripts\pip install -r requirements.txt
+.venv\Scripts\python app.py
+```
+
+### macOS / Linux
+
+暂无打包好的可执行文件，需要从源码运行。仓库自带的 `bilix.exe` 是 Windows
+专用二进制，无法在这两个平台上执行；程序会自动改用 `bilix_client.py`（纯
+Python 实现的哔哩哔哩扫码登录与下载），功能上没有区别。
+
+需要先装好 [ffmpeg](https://ffmpeg.org/)（用于合并哔哩哔哩下载的音视频流）：
+
+```bash
+brew install ffmpeg   # macOS
+```
+
+安装依赖并启动：
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+python app.py
+```
+
+浏览器会自动打开 <http://127.0.0.1:5000>。如果打不开或提示端口被占用，大概率是
+macOS 自带的 AirPlay 接收器占用了 5000 端口（系统设置里关掉即可，或换个端口）：
+
+```bash
+PORT=5877 python app.py
+```

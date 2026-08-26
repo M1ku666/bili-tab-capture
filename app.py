@@ -2,6 +2,7 @@ import contextlib
 import hashlib
 import io
 import json
+import platform
 import re
 import shutil
 import subprocess
@@ -14,6 +15,7 @@ import webbrowser
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
+import bilix_client
 from runtime_paths import data_dir, resource_dir
 from flask import Flask, jsonify, render_template, request, send_file, send_from_directory
 from werkzeug.utils import secure_filename
@@ -135,11 +137,41 @@ BILIBILI_LOGIN_PROCESS: Optional[subprocess.Popen] = None
 
 
 def bilibili_cookie_path() -> Path:
-    return Path(BILIX_EXE.parent) / "cookie.txt"
+    if platform.system() == "Windows":
+        return Path(BILIX_EXE.parent) / "cookie.txt"
+    return bilix_client.COOKIE_PATH
 
 
 def run_bilibili_login_worker(token: str) -> None:
     global BILIBILI_LOGIN_PROCESS
+
+    if platform.system() != "Windows":
+        try:
+            qrcode_key, qr_data_uri = bilix_client.qrcode_login_generate()
+        except Exception as exc:
+            with BILIBILI_LOGIN_LOCK:
+                if BILIBILI_LOGIN_TOKEN == token:
+                    BILIBILI_LOGIN.update(status="error", qr=None, message=f"无法生成二维码：{exc}")
+            return
+
+        with BILIBILI_LOGIN_LOCK:
+            if BILIBILI_LOGIN_TOKEN != token:
+                return
+            BILIBILI_LOGIN.update(qr=qr_data_uri, message="请用哔哩哔哩扫描二维码登录")
+
+        try:
+            cookie = bilix_client.qrcode_login_poll(qrcode_key)
+        except Exception as exc:
+            with BILIBILI_LOGIN_LOCK:
+                if BILIBILI_LOGIN_TOKEN == token:
+                    BILIBILI_LOGIN.update(status="error", qr=None, message=str(exc))
+            return
+
+        bilix_client.write_cookie(cookie)
+        with BILIBILI_LOGIN_LOCK:
+            if BILIBILI_LOGIN_TOKEN == token:
+                BILIBILI_LOGIN.update(status="success", qr=None, message="登录成功。")
+        return
 
     cwd = str(BILIX_EXE.parent)
     cookie_path = bilibili_cookie_path()

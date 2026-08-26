@@ -1,6 +1,7 @@
 import argparse
 import json
 import os
+import platform
 import re
 import shutil
 import subprocess
@@ -40,9 +41,13 @@ HEADER_LINE_HEIGHT_RATIO = 1.2  # 标题/作者行高 = 字号 × 该比例（�
 
 # --- Bilibili support -----------------------------------------------------
 
+# Windows: use the bundled bilix.exe (unchanged). Other platforms: bilix.exe
+# is a Windows PE binary and cannot run there, so fall back to bilix_client,
+# a pure-Python reimplementation of the same login/download flow.
+import bilix_client
 from runtime_paths import ensure_bilix
 
-BILIX_EXE = ensure_bilix()
+BILIX_EXE = ensure_bilix() if platform.system() == "Windows" else None
 BILIX_ENV = {**os.environ, "PYTHONIOENCODING": "utf-8", "PYTHONUTF8": "1"}
 VIDEO_FILE_EXTENSIONS = (".mp4", ".mkv", ".webm", ".mov")
 BILIBILI_USER_AGENT = (
@@ -354,9 +359,15 @@ def download_bilibili_video(
     output_dir: Path,
     quality: Optional[int] = None,
 ) -> Path:
-    """Download a Bilibili video with the bundled bilix.exe, returning the file path."""
+    """Download a Bilibili video, via bilix.exe on Windows or bilix_client elsewhere."""
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
+
+    if platform.system() != "Windows":
+        cookie = bilix_client.read_cookie()
+        return bilix_client.download_bilibili_video_native(
+            url, output_dir, quality=quality, cookie=cookie
+        )
 
     if not BILIX_EXE.exists():
         raise RuntimeError(f"未找到 bilix.exe：{BILIX_EXE}")
