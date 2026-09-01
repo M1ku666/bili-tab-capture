@@ -1525,9 +1525,34 @@ def preview_file(filename: str):
 
 if __name__ == "__main__":
     ensure_cache_dirs()
-    port = int(os.environ.get("PORT", "5000"))
+
+    def _port_free(p: int) -> bool:
+        import socket as _socket
+
+        with contextlib.closing(_socket.socket()) as s:
+            s.settimeout(0.5)
+            try:
+                s.bind(("127.0.0.1", p))
+                return True
+            except OSError:
+                return False
+
+    # 默认 5000 常被 macOS AirPlay 接收器占用；若被占用则自动改用下一个空闲端口，
+    # 避免一启动就报 “Address already in use” 直接退出（表现为“打不开/运行不了”）。
+    requested = int(os.environ.get("PORT", "5000"))
+    port = requested
+    if not _port_free(port):
+        for candidate in range(requested + 1, requested + 30):
+            if _port_free(candidate):
+                port = candidate
+                break
+        else:
+            pass  # 都不空闲则交给 Flask 报错
+    if port != requested:
+        print(f"端口 {requested} 被占用，已自动改用端口 {port}。")
+
     url = f"http://127.0.0.1:{port}"
-    if not os.environ.get("BILIX_NO_BROWSER"):
+    if not os.environ.get("BTAB_NO_BROWSER"):
         threading.Timer(1.0, lambda: webbrowser.open(url)).start()
     print(f"服务器已启动：{url}")
     app.run(host="127.0.0.1", port=port, debug=False, use_reloader=False)

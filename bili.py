@@ -149,10 +149,31 @@ def _download_stream(url: str, headers: dict, dest: Path) -> None:
 
 
 def find_ffmpeg() -> str:
+    """查找可用的 ffmpeg。
+
+    打包时（build_mac.sh / build_exe.bat）会把 ffmpeg 二进制带进包内，
+    这里优先使用随包附带的版本（无需在目标机器额外安装）；未打包运行或
+    打包脚本未附带上时，回退到系统 PATH 中的 ffmpeg。
+    """
+    # 随包附带的 ffmpeg：macOS 二进制名 ffmpeg；Windows 为 ffmpeg.exe。
+    candidates = [
+        resource_dir() / "ffmpeg",
+        resource_dir() / "ffmpeg.exe",
+        data_dir() / "ffmpeg",
+        data_dir() / "ffmpeg.exe",
+    ]
+    for p in candidates:
+        if p.is_file():
+            return str(p)
+
     path = shutil.which("ffmpeg")
     if not path:
-        raise RuntimeError("未找到 ffmpeg，请先安装（macOS：brew install ffmpeg）。")
+        raise RuntimeError(
+            "未找到 ffmpeg。请安装它（macOS：brew install ffmpeg；Windows/Linux："
+            "下载 ffmpeg 并加入 PATH），或在打包时随程序附带 ffmpeg 二进制。"
+        )
     return path
+
 
 def merge_av(video_file: Path, audio_file: Path, output_file: Path) -> None:
     ffmpeg = find_ffmpeg()
