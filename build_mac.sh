@@ -91,6 +91,7 @@ mkdir -p build/.pyinstaller
     --collect-submodules "cv2" \
     --collect-submodules "curl_cffi" \
     --collect-submodules "qrcode" \
+    --hidden-import "qrcode" \
     app.py
 
 echo "==> [5/5] 完成"

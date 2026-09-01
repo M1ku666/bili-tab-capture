@@ -36,6 +36,7 @@ echo [2/4] Building single-file exe ...
     --collect-submodules "cv2" ^
     --collect-submodules "curl_cffi" ^
     --collect-submodules "qrcode" ^
+    --hidden-import "qrcode" ^
     app.py || goto :error
 
 echo [3/4] Done.
