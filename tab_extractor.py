@@ -1117,8 +1117,21 @@ def extract_unique_crops(
     return stats
 
 
+# 中文（CJK）标题/作者必须能找到一款带中文字形的字体，否则 PIL 会退化为
+# 默认 bitmap 字体而把所有汉字/假名渲染成“豆腐块”。因此这里同时收录
+# Windows 与 macOS 系统自带的字体文件：
+#   - Windows: 微软雅黑 msyh.ttc / 黑体 simhei.ttf / 宋体 simsun.ttc 等
+#   - macOS:   PingFang 不存在于固定路径,改用 苹方同款字形稳定的
+#              Hiragino Sans GB.ttc、宋体 Songti.ttc、STHeiti（黑体）
+#   - 通用:    DejaVu Sans（不带中文,仅兜底西文/页码）
 _FONT_FILES = {
     "msyh": ["msyh.ttc", "msyh.ttf"],
+    "hiragino": [
+        "Hiragino Sans GB.ttc",
+        "Hiragino Kaku Gothic ProN.ttc",
+    ],
+    "songti": ["Songti.ttc"],
+    "heiti": ["STHeiti Light.ttc", "STHeiti Medium.ttc"],
     "simsun": ["simsun.ttc", "simsun.ttf"],
     "simhei": ["simhei.ttf"],
     "simkai": ["simkai.ttf"],
@@ -1128,8 +1141,12 @@ _FONT_FILES = {
     "verdana": ["verdana.ttf"],
 }
 
-# 兜底候选：优先中文字体，保证中文标题/作者正常渲染。
+# 兜底候选：优先 CJK 字体（macOS 先 Hiragino 再 Songti/STHeiti,Windows 走
+# 微软雅黑/宋体/黑体）,保证中文标题/作者正常渲染；最后的无中文字体仅兜底西文。
 _DEFAULT_FONT_FILES = [
+    "Hiragino Sans GB.ttc",
+    "Songti.ttc",
+    "STHeiti Light.ttc",
     "msyh.ttc",
     "msyh.ttf",
     "simhei.ttf",
@@ -1143,19 +1160,27 @@ _DEFAULT_FONT_FILES = [
 
 
 def load_font(size: int, family: Optional[str] = None):
-    windows_fonts = Path(os.environ.get("WINDIR", r"C:\Windows")) / "Fonts"
+    # 跨平台候选目录（macOS 中文字体多位于 System/Library/Fonts 及其
+    # Supplemental 子目录；Windows 位于 Fonts；Linux 常见于 /usr/share/fonts）。
+    candidate_dirs = [
+        Path("/System/Library/Fonts"),
+        Path("/System/Library/Fonts/Supplemental"),
+        Path("/Library/Fonts"),
+        Path(os.environ.get("WINDIR", r"C:\Windows")) / "Fonts",
+        Path("/usr/share/fonts/opentype"),
+        Path("/usr/share/fonts/truetype"),
+        Path.home() / "Library" / "Fonts",
+        Path("."),
+    ]
+    # 若指定了字体族,优先其专属文件；随后无论如何都按兜底顺序（含各平台
+    # 中文字体）继续找,保证中文能命中一款可用的 CJK 字体。
     names = list(_FONT_FILES.get(family or "", [])) + _DEFAULT_FONT_FILES
 
     for name in names:
-        for font_path in (
-            windows_fonts / name,
-            Path("/System/Library/Fonts/Supplemental") / name,
-            Path("/Library/Fonts") / name,
-            Path("/usr/share/fonts/truetype") / name,
-            name,
-        ):
+        for font_path in (Path(d) / name for d in candidate_dirs):
             try:
-                return ImageFont.truetype(font_path, size)
+                if font_path.is_file():
+                    return ImageFont.truetype(str(font_path), size)
             except OSError:
                 continue
 
