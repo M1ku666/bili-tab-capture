@@ -16,7 +16,7 @@ def is_frozen() -> bool:
 
 
 def resource_dir() -> Path:
-    """只读的打包资源目录：模板、静态文件、内置 ffmpeg 等。"""
+    """只读的打包资源目录：模板、静态文件等。"""
     if _FROZEN:
         return Path(getattr(sys, "_MEIPASS", Path(sys.executable).resolve().parent))
     return Path(__file__).resolve().parent

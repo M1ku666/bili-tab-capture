@@ -1,8 +1,6 @@
 .DS_Store
 cookie.txt
 todo.txt
-ffmpeg
-ffmpeg.exe
 
 # Python
 __pycache__/

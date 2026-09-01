@@ -6,10 +6,7 @@ macOS / Linux / Windows 运行。
 
 import base64
 import io
-import json
 import re
-import shutil
-import subprocess
 import time
 from pathlib import Path
 from typing import Optional
@@ -17,7 +14,7 @@ from typing import Optional
 import qrcode
 from curl_cffi import requests as curl_requests
 
-from runtime_paths import data_dir, resource_dir
+from runtime_paths import data_dir
 
 COOKIE_PATH = data_dir() / "cookie.txt"
 
@@ -30,9 +27,8 @@ _BASE_HEADERS = {
 
 _session = curl_requests.Session(headers=_BASE_HEADERS, impersonate="chrome124")
 
-_PLAYINFO_RE = re.compile(r"window\.__playinfo__\s*=\s*(\{.*?})\s*</script>", re.DOTALL)
-_INITIAL_STATE_RE = re.compile(r"window\.__INITIAL_STATE__\s*=\s*(\{.*?})\s*;", re.DOTALL)
-_PLAYURL_SSR_RE = re.compile(r"const\s+playurlSSRData\s*=\s*(\{.*?})\s", re.DOTALL)
+# 单文件 MP4 流的可尝试清晰度（qn），从高到低。未登录时 B 站会自动降到可用档。
+_FALLBACK_QN = (116, 112, 80, 64, 32, 16)
 
 
 def read_cookie() -> Optional[str]:
@@ -92,52 +88,63 @@ def qrcode_login_poll(qrcode_key: str, timeout: float = 180.0, interval: float =
     raise TimeoutError("登录超时，请重试。")
 
 
-def _extract_json(pattern: re.Pattern, text: str):
-    match = pattern.search(text)
-    if not match:
-        return None
-    try:
-        return json.loads(match.group(1))
-    except json.JSONDecodeError:
-        return None
-
-
-def _parse_page(url: str, cookie: Optional[str]) -> dict:
+def _session_headers(url: str, cookie: Optional[str]) -> dict:
     headers = dict(_BASE_HEADERS)
     headers["Referer"] = url
     if cookie:
         headers["Cookie"] = cookie
-    resp = _session.get(url, headers=headers, timeout=15)
+    return headers
+
+
+def _get_cid(url: str, cookie: Optional[str]) -> int:
+    """从 view 接口拿视频 cid（分 P 取第一个）。"""
+    bvid = extract_bvid(url)
+    view_url = "https://api.bilibili.com/x/web-interface/view?bvid=" + bvid
+    resp = _session.get(view_url, headers=_session_headers(url, cookie), timeout=15)
     resp.raise_for_status()
-    html = resp.text
-    return {
-        "playinfo": _extract_json(_PLAYINFO_RE, html),
-        "initial_state": _extract_json(_INITIAL_STATE_RE, html),
-        "playurl_ssr_data": _extract_json(_PLAYURL_SSR_RE, html),
-    }
+    data = resp.json().get("data") or {}
+    pages = data.get("pages") or []
+    cid = (pages[0].get("cid") if pages else None) or data.get("cid")
+    if not cid:
+        raise RuntimeError("无法获取该视频的 cid。")
+    return int(cid)
 
 
-def _find_dash(parsed: dict) -> dict:
-    playurl_ssr = parsed.get("playurl_ssr_data")
-    if playurl_ssr:
-        result = playurl_ssr.get("result")
-        raw = playurl_ssr.get("raw")
-        if result:
-            dash = result.get("video_info", {}).get("dash")
-            if dash:
-                return dash
-        if raw:
-            dash = raw.get("data", {}).get("video_info", {}).get("dash")
-            if dash:
-                return dash
+def extract_bvid(url: str) -> str:
+    m = re.search(r"BV[0-9A-Za-z]{10}", url)
+    if not m:
+        raise ValueError("无法从链接中解析 BV 号。")
+    return m.group(0)
 
-    playinfo = parsed.get("playinfo")
-    if playinfo:
-        dash = playinfo.get("data", {}).get("dash")
-        if dash:
-            return dash
 
-    raise RuntimeError("无法获取播放地址，可能需要登录或该视频不支持在线播放。")
+def _find_durl(url: str, cid: int, cookie: Optional[str], quality: Optional[int]) -> str:
+    """请求 playurl 拿到单文件 MP4 流的直链，返回该直链 URL。
+
+    先用默认/指定清晰度尝试；拿不到再按 _FALLBACK_QN 从高到低降级。
+    未登录时 B 站会自动把高 qn 降到可用档。
+    """
+    bvid = extract_bvid(url)
+    attempts = []
+    if quality is not None:
+        attempts.append(quality)
+    for q in _FALLBACK_QN:
+        if q not in attempts:
+            attempts.append(q)
+
+    for q in attempts:
+        playurl = (
+            "https://api.bilibili.com/x/player/playurl?bvid=%s&cid=%s&qn=%s&fnval=0&fnver=0&fourk=1"
+            % (bvid, cid, q)
+        )
+        resp = _session.get(playurl, headers=_session_headers(url, cookie), timeout=15)
+        resp.raise_for_status()
+        data = resp.json().get("data") or {}
+        durl = data.get("durl") or []
+        if durl:
+            direct = durl[0].get("url")
+            if direct:
+                return direct
+    raise RuntimeError("无法获取可下载的 MP4 播放地址，可能需要登录。")
 
 
 def _download_stream(url: str, headers: dict, dest: Path) -> None:
@@ -146,42 +153,6 @@ def _download_stream(url: str, headers: dict, dest: Path) -> None:
     with open(dest, "wb") as f:
         for chunk in resp.iter_content(chunk_size=1024 * 1024):
             f.write(chunk)
-
-
-def find_ffmpeg() -> str:
-    """查找可用的 ffmpeg。
-
-    打包时（build_mac.sh / build_exe.bat）会把 ffmpeg 二进制带进包内，
-    这里优先使用随包附带的版本（无需在目标机器额外安装）；未打包运行或
-    打包脚本未附带上时，回退到系统 PATH 中的 ffmpeg。
-    """
-    # 随包附带的 ffmpeg：macOS 二进制名 ffmpeg；Windows 为 ffmpeg.exe。
-    candidates = [
-        resource_dir() / "ffmpeg",
-        resource_dir() / "ffmpeg.exe",
-        data_dir() / "ffmpeg",
-        data_dir() / "ffmpeg.exe",
-    ]
-    for p in candidates:
-        if p.is_file():
-            return str(p)
-
-    path = shutil.which("ffmpeg")
-    if not path:
-        raise RuntimeError(
-            "未找到 ffmpeg。请安装它（macOS：brew install ffmpeg；Windows/Linux："
-            "下载 ffmpeg 并加入 PATH），或在打包时随程序附带 ffmpeg 二进制。"
-        )
-    return path
-
-
-def merge_av(video_file: Path, audio_file: Path, output_file: Path) -> None:
-    ffmpeg = find_ffmpeg()
-    command = [ffmpeg, "-y", "-i", str(video_file), "-i", str(audio_file), "-c", "copy", str(output_file)]
-    result = subprocess.run(command, capture_output=True, text=True)
-    if result.returncode != 0:
-        detail = (result.stderr or result.stdout or "").strip()
-        raise RuntimeError(f"ffmpeg 合并音视频失败：{detail[-500:]}")
 
 
 def download_bilibili_video_native(
@@ -193,36 +164,10 @@ def download_bilibili_video_native(
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    parsed = _parse_page(url, cookie)
-    dash = _find_dash(parsed)
+    cid = _get_cid(url, cookie)
+    direct_url = _find_durl(url, cid, cookie, quality)
 
-    videos = dash.get("video") or []
-    audios = dash.get("audio") or []
-    if not videos or not audios:
-        raise RuntimeError("未找到可下载的音视频流。")
-
-    selected = None
-    if quality:
-        selected = next((v for v in videos if v.get("id") == quality), None)
-    if not selected:
-        selected = max(videos, key=lambda v: v.get("id", 0))
-    audio = max(audios, key=lambda a: a.get("bandwidth", 0))
-
-    headers = dict(_BASE_HEADERS)
-    headers["Referer"] = url
-    if cookie:
-        headers["Cookie"] = cookie
-
-    video_tmp = output_dir / "_video.m4s"
-    audio_tmp = output_dir / "_audio.m4s"
-    try:
-        _download_stream(selected.get("baseUrl") or selected.get("base_url"), headers, video_tmp)
-        _download_stream(audio.get("baseUrl") or audio.get("base_url"), headers, audio_tmp)
-
-        output_path = output_dir / "video.mp4"
-        merge_av(video_tmp, audio_tmp, output_path)
-    finally:
-        video_tmp.unlink(missing_ok=True)
-        audio_tmp.unlink(missing_ok=True)
-
+    output_path = output_dir / "video.mp4"
+    headers = _session_headers(url, cookie)
+    _download_stream(direct_url, headers, output_path)
     return output_path

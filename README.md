@@ -43,12 +43,6 @@
 
 ## 从源码运行
 
-安装 ffmpeg
-```bash
-brew install ffmpeg # macOS
-winget install --id Gyan.FFmpeg -e # Windows
-```
-
 安装依赖
 ```bash
 python -m venv .venv
