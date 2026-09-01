@@ -43,44 +43,11 @@
 
 ## 从源码运行
 
-### Windows
-
 安装 ffmpeg
 ```bash
-winget install --id Gyan.FFmpeg -e
+brew install ffmpeg # macOS
+winget install --id Gyan.FFmpeg -e # Windows
 ```
-
-### macOS
-
-安装 ffmpeg
-```bash
-brew install ffmpeg
-```
-
-### 安卓
-
-在应用市场下载Termux，之后运行
-
-```bash
-pkg update -y
-pkg install -y git
-pkg install -y python ffmpeg
-git clone https://gitee.com/m1ku666/bili-tab-capture.git
-cd bili-tab-capture
-```
-
-然后运行「后续」里的步骤
-
-之后每次启动Termux时运行
-
-```bash
-cd bili-tab-capture
-python app.py
-```
-
-然后在浏览器里打开http://127.0.0.1:5000即可
-
-### 后续
 
 安装依赖
 ```bash
@@ -99,5 +66,5 @@ python app.py
 | 平台    | 脚本          | 产物                    |
 | ------- | ------------- | ----------------------- |
 | Windows | build_exe.bat | dist/BiliTabCapture.exe |
-| MacOS   | build_mac.sh  | dist/BiliTabCapture_mac |
+| macOS   | build_mac.sh  | dist/BiliTabCapture_mac |
 
