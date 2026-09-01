@@ -2,7 +2,7 @@
 
 将本地或哔哩哔哩的动态谱视频转换为PDF文件
 
-相比[TabCapture](https://github.com/santiRostan/TabCapture)新增更多功能
+相比[TabCapture](https://github.com/santiRostan/TabCapture)新增更多功能，移除Youtube视频下载功能
 
 ## 新增功能
 
@@ -36,56 +36,68 @@
 
 仅供学习与练习使用，若UP主提供谱面购买链接请勿使用本工具，尊重辛苦扒谱劳动成果
 
-登录由[bilix](https://github.com/Koril33/bilix)处理，风险与本项目无关
-
 ## 致谢
 
 - [santiRostan/TabCapture](https://github.com/santiRostan/TabCapture) 项目框架及截图算法
-- [Koril33/bilix](https://github.com/Koril33/bilix) 哔哩哔哩视频下载，有部分改动，详见[m1ku666/bilix](https://gitee.com/m1ku666/bilix)
 - [Carrot-shreds/score_capture](https://github.com/Carrot-shreds/score_capture) 自动识别小节线及裁剪去重
 
-## 配置
-
-需要 **Python >= 3.10**（requirements.txt 中的 yt-dlp 固定安装自 GitHub master 分支，
-以避免 PyPI 正式版更新滞后于 YouTube 改动导致下载失败，而该分支要求 Python >= 3.10）。
+## 从源码运行
 
 ### Windows
 
-打包好的 `BiliTabCapture.exe` 双击即可运行，无需安装 Python。自行打包请运行
-`build_exe.bat`，产物在 `dist/BiliTabCapture.exe`。
-
-从源码运行：
-
+安装 ffmpeg
 ```bash
-python -m venv .venv
-.venv\Scripts\pip install -r requirements.txt
-.venv\Scripts\python app.py
+winget install --id Gyan.FFmpeg -e
 ```
 
-### macOS / Linux
+### macOS
 
-暂无打包好的可执行文件，需要从源码运行。仓库自带的 `bilix.exe` 是 Windows
-专用二进制，无法在这两个平台上执行；程序会自动改用 `bilix_client.py`（纯
-Python 实现的哔哩哔哩扫码登录与下载），功能上没有区别。
-
-需要先装好 [ffmpeg](https://ffmpeg.org/)（用于合并哔哩哔哩下载的音视频流）：
-
+安装 ffmpeg
 ```bash
-brew install ffmpeg   # macOS
+brew install ffmpeg
 ```
 
-安装依赖并启动：
+### 安卓
+
+在应用市场下载Termux，之后运行
 
 ```bash
-python3 -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
+pkg update -y
+pkg install -y git
+pkg install -y python ffmpeg
+git clone https://gitee.com/m1ku666/bili-tab-capture.git
+cd bili-tab-capture
+```
+
+然后运行「后续」里的步骤
+
+之后每次启动Termux时运行
+
+```bash
+cd bili-tab-capture
 python app.py
 ```
 
-浏览器会自动打开 <http://127.0.0.1:5000>。如果打不开或提示端口被占用，大概率是
-macOS 自带的 AirPlay 接收器占用了 5000 端口（系统设置里关掉即可，或换个端口）：
+然后在浏览器里打开http://127.0.0.1:5000即可
 
+### 后续
+
+安装依赖
 ```bash
-PORT=5877 python app.py
+python -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
 ```
+
+运行
+```bash
+python app.py
+```
+
+## 打包
+
+| 平台    | 脚本          | 产物                    |
+| ------- | ------------- | ----------------------- |
+| Windows | build_exe.bat | dist/BiliTabCapture.exe |
+| MacOS   | build_mac.sh  | dist/BiliTabCapture_mac |
+
