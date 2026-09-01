@@ -2,11 +2,5 @@ Flask
 numpy
 opencv-python
 Pillow
-# PyPI 正式版更新常跟不上 YouTube 的改动，容易出现 "The page needs to be
-# reloaded" 之类的提取失败；改用 GitHub master 开发版，需要 Python >= 3.10。
-yt-dlp @ https://github.com/yt-dlp/yt-dlp/archive/master.tar.gz
-
-# 非 Windows 平台：bilix.exe 是 Windows PE 二进制无法执行，改用
-# bilix_client.py 直接对接哔哩哔哩接口实现扫码登录与下载，仅需这两个依赖。
-curl_cffi; platform_system != "Windows"
-qrcode; platform_system != "Windows"
+curl_cffi
+qrcode

@@ -2,10 +2,8 @@ import contextlib
 import hashlib
 import io
 import json
-import platform
 import re
 import shutil
-import subprocess
 import tempfile
 import threading
 import time
@@ -15,15 +13,13 @@ import webbrowser
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-import bilix_client
+import bili
 from runtime_paths import data_dir, resource_dir
 from flask import Flask, jsonify, render_template, request, send_file, send_from_directory
 from werkzeug.utils import secure_filename
 from PIL import Image, ImageOps
 
 from tab_extractor import (
-    BILIX_EXE,
-    BILIX_ENV,
     ExtractionOptions,
     ExtractionStats,
     RESAMPLE,
@@ -32,10 +28,8 @@ from tab_extractor import (
     build_pdf_from_images,
     build_video_metadata,
     compute_stitch_seams,
-    decode_bytes,
     detect_measure_barlines,
     download_bilibili_video,
-    download_video,
     extract_bilibili_id,
     extract_note_mask,
     extract_unique_crops,
@@ -131,94 +125,41 @@ STORE_LOCK = threading.Lock()
 BILIBILI_LOGIN_LOCK = threading.Lock()
 BILIBILI_LOGIN: Dict[str, Any] = {"status": "idle", "qr": None, "message": None}
 BILIBILI_LOGIN_TOKEN: Optional[str] = None
-BILIBILI_LOGIN_PROCESS: Optional[subprocess.Popen] = None
 
 
 def bilibili_cookie_path() -> Path:
-    if platform.system() == "Windows":
-        return Path(BILIX_EXE.parent) / "cookie.txt"
-    return bilix_client.COOKIE_PATH
+    # 所有平台统一由 bili 模块管理的 cookie.txt。
+    return bili.COOKIE_PATH
 
 
 def run_bilibili_login_worker(token: str) -> None:
-    global BILIBILI_LOGIN_PROCESS
-
-    if platform.system() != "Windows":
-        try:
-            qrcode_key, qr_data_uri = bilix_client.qrcode_login_generate()
-        except Exception as exc:
-            with BILIBILI_LOGIN_LOCK:
-                if BILIBILI_LOGIN_TOKEN == token:
-                    BILIBILI_LOGIN.update(status="error", qr=None, message=f"无法生成二维码：{exc}")
-            return
-
-        with BILIBILI_LOGIN_LOCK:
-            if BILIBILI_LOGIN_TOKEN != token:
-                return
-            BILIBILI_LOGIN.update(qr=qr_data_uri, message="请用哔哩哔哩扫描二维码登录")
-
-        try:
-            cookie = bilix_client.qrcode_login_poll(qrcode_key)
-        except Exception as exc:
-            with BILIBILI_LOGIN_LOCK:
-                if BILIBILI_LOGIN_TOKEN == token:
-                    BILIBILI_LOGIN.update(status="error", qr=None, message=str(exc))
-            return
-
-        bilix_client.write_cookie(cookie)
-        with BILIBILI_LOGIN_LOCK:
-            if BILIBILI_LOGIN_TOKEN == token:
-                BILIBILI_LOGIN.update(status="success", qr=None, message="登录成功。")
-        return
-
-    cwd = str(BILIX_EXE.parent)
-    cookie_path = bilibili_cookie_path()
-    cookie_before = cookie_path.stat().st_mtime if cookie_path.exists() else None
-
+    """全平台统一的 B 站扫码登录。"""
     try:
-        proc = subprocess.Popen(
-            [str(BILIX_EXE), "--login"],
-            cwd=cwd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            env=BILIX_ENV,
-        )
+        qrcode_key, qr_data_uri = bili.qrcode_login_generate()
     except Exception as exc:
         with BILIBILI_LOGIN_LOCK:
             if BILIBILI_LOGIN_TOKEN == token:
-                BILIBILI_LOGIN.update(
-                    status="error", qr=None, message=f"无法启动 bilix：{exc}"
-                )
+                BILIBILI_LOGIN.update(status="error", qr=None, message=f"无法生成二维码：{exc}")
         return
 
-    BILIBILI_LOGIN_PROCESS = proc
-    qr_re = re.compile(r"data:image/[A-Za-z]+;base64,[A-Za-z0-9+/=]+")
+    with BILIBILI_LOGIN_LOCK:
+        if BILIBILI_LOGIN_TOKEN != token:
+            return
+        BILIBILI_LOGIN.update(qr=qr_data_uri, message="请用哔哩哔哩扫描二维码登录")
 
-    for raw_line in proc.stdout:
-        line = decode_bytes(raw_line)
+    try:
+        cookie = bili.qrcode_login_poll(qrcode_key)
+    except Exception as exc:
         with BILIBILI_LOGIN_LOCK:
-            if BILIBILI_LOGIN["qr"] is None:
-                match = qr_re.search(line)
-                if match:
-                    BILIBILI_LOGIN["qr"] = match.group(0)
-                    BILIBILI_LOGIN["message"] = "请用哔哩哔哩扫描二维码登录"
+            if BILIBILI_LOGIN_TOKEN == token:
+                BILIBILI_LOGIN.update(status="error", qr=None, message=str(exc))
+        return
 
-    proc.wait()
-    BILIBILI_LOGIN_PROCESS = None
-
-    cookie_after = cookie_path.stat().st_mtime if cookie_path.exists() else None
-    success = cookie_after is not None and cookie_after != cookie_before
-
+    bili.write_cookie(cookie)
     with BILIBILI_LOGIN_LOCK:
         if BILIBILI_LOGIN_TOKEN == token:
-            if success:
-                BILIBILI_LOGIN.update(
-                    status="success", qr=None, message="登录成功。"
-                )
-            else:
-                BILIBILI_LOGIN.update(
-                    status="error", qr=None, message="登录失败或超时。"
-                )
+            BILIBILI_LOGIN.update(status="success", qr=None, message="登录成功。")
+    return
 
 
 def ensure_cache_dirs() -> None:
@@ -652,7 +593,7 @@ def run_bilibili_download(source_id: str, url: str, cache_dir: Path, bvid: str) 
     """Background Bilibili download started at import time."""
     try:
         path = download_bilibili_video(url, cache_dir)
-        # 统一重命名为 BVxxxx.mp4，避免 bilix 用视频标题（可能含中文/特殊字符）作文件名。
+        # 统一重命名为 BVxxxx.mp4，避免直接用视频标题（可能含中文/特殊字符）作文件名。
         target = cache_dir / f"{bvid}.mp4"
         if path.resolve() != target.resolve():
             shutil.move(str(path), str(target))
@@ -869,9 +810,6 @@ def bilibili_login_start():
         if BILIBILI_LOGIN["status"] == "running":
             return jsonify(dict(BILIBILI_LOGIN))
 
-    if BILIBILI_LOGIN_PROCESS is not None:
-        BILIBILI_LOGIN_PROCESS.terminate()
-
     token = uuid.uuid4().hex
     with BILIBILI_LOGIN_LOCK:
         BILIBILI_LOGIN_TOKEN = token
@@ -899,10 +837,6 @@ def bilibili_login_status():
 @app.post("/api/bilibili/logout")
 def bilibili_logout():
     global BILIBILI_LOGIN_TOKEN
-
-    proc = BILIBILI_LOGIN_PROCESS
-    if proc is not None:
-        proc.terminate()
 
     with BILIBILI_LOGIN_LOCK:
         BILIBILI_LOGIN_TOKEN = None

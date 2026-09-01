@@ -1,10 +1,8 @@
 import argparse
 import json
 import os
-import platform
 import re
 import shutil
-import subprocess
 import tempfile
 import urllib.parse
 import urllib.request
@@ -37,14 +35,8 @@ HEADER_LINE_HEIGHT_RATIO = 1.2  # 标题/作者行高 = 字号 × 该比例（�
 
 # --- Bilibili support -----------------------------------------------------
 
-# Windows: use the bundled bilix.exe (unchanged). Other platforms: bilix.exe
-# is a Windows PE binary and cannot run there, so fall back to bilix_client,
-# a pure-Python reimplementation of the same login/download flow.
-import bilix_client
-from runtime_paths import ensure_bilix
+import bili
 
-BILIX_EXE = ensure_bilix() if platform.system() == "Windows" else None
-BILIX_ENV = {**os.environ, "PYTHONIOENCODING": "utf-8", "PYTHONUTF8": "1"}
 VIDEO_FILE_EXTENSIONS = (".mp4", ".mkv", ".webm", ".mov")
 BILIBILI_USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -163,15 +155,6 @@ def is_bilibili_url(value: str) -> bool:
     return "bilibili.com" in host or "b23.tv" in host
 
 
-def decode_bytes(data: bytes) -> str:
-    for encoding in ("utf-8", "gbk", "cp936"):
-        try:
-            return data.decode(encoding)
-        except UnicodeDecodeError:
-            continue
-    return data.decode("utf-8", errors="replace")
-
-
 def _resolve_url(url: str) -> str:
     request = urllib.request.Request(url, headers={"User-Agent": BILIBILI_USER_AGENT})
     with _NO_PROXY_OPENER.open(request, timeout=20) as response:
@@ -266,47 +249,17 @@ def download_bilibili_video(
     output_dir: Path,
     quality: Optional[int] = None,
 ) -> Path:
-    """Download a Bilibili video, via bilix.exe on Windows or bilix_client elsewhere."""
+    """下载 B 站视频。所有平台统一走 bili 模块（纯 Python 实现）。
+
+    bili 模块需要已登录的 cookie 才能拿更高清晰度；未登录时按接口默认清晰度。
+    """
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    if platform.system() != "Windows":
-        cookie = bilix_client.read_cookie()
-        return bilix_client.download_bilibili_video_native(
-            url, output_dir, quality=quality, cookie=cookie
-        )
-
-    if not BILIX_EXE.exists():
-        raise RuntimeError(f"未找到 bilix.exe：{BILIX_EXE}")
-
-    command = [str(BILIX_EXE), "-s", str(output_dir)]
-    if quality is not None:
-        command += ["-q", str(quality)]
-    command.append(url)
-
-    completed = subprocess.run(
-        command,
-        capture_output=True,
-        cwd=str(BILIX_EXE.parent),
-        env=BILIX_ENV,
+    cookie = bili.read_cookie()
+    return bili.download_bilibili_video_native(
+        url, output_dir, quality=quality, cookie=cookie
     )
-    stdout = decode_bytes(completed.stdout)
-    stderr = decode_bytes(completed.stderr)
-
-    if completed.returncode != 0:
-        detail = (stderr or stdout).strip()
-        raise RuntimeError(detail or f"bilix 退出，返回码 {completed.returncode}")
-
-    for line in (stdout + "\n" + stderr).splitlines():
-        line = line.strip()
-        if line:
-            print(f"[bilix] {line}")
-
-    video_path = find_video_file(output_dir)
-    if video_path is None:
-        raise FileNotFoundError("bilix 已结束，但未找到视频文件。")
-
-    return video_path
 
 
 def is_mostly_dark_or_blank(image: Image.Image, std_threshold: float = 8.0) -> bool:

@@ -1,8 +1,7 @@
-"""原生 Python 实现的哔哩哔哩扫码登录与视频下载。
+"""纯 Python 实现的哔哩哔哩扫码登录与视频下载。
 
-替代原先随仓库分发的 Windows 专用 bilix.exe（通过 subprocess 调用），
-改为直接用 curl_cffi 调用 B 站扫码登录 / 播放地址接口，纯 Python 实现，
-可在 macOS / Linux / Windows 上运行。
+直接用 curl_cffi 调用 B 站扫码登录 / 播放地址接口，纯 Python 实现，可跨
+macOS / Linux / Windows 运行。
 """
 
 import base64
@@ -18,7 +17,7 @@ from typing import Optional
 import qrcode
 from curl_cffi import requests as curl_requests
 
-from runtime_paths import data_dir
+from runtime_paths import data_dir, resource_dir
 
 COOKIE_PATH = data_dir() / "cookie.txt"
 
@@ -154,7 +153,6 @@ def find_ffmpeg() -> str:
     if not path:
         raise RuntimeError("未找到 ffmpeg，请先安装（macOS：brew install ffmpeg）。")
     return path
-
 
 def merge_av(video_file: Path, audio_file: Path, output_file: Path) -> None:
     ffmpeg = find_ffmpeg()
