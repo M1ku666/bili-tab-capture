@@ -17,10 +17,6 @@ import cv2
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont, ImageOps, ImageStat
 
-try:
-    from yt_dlp import YoutubeDL
-except ImportError:
-    YoutubeDL = None
 
 
 # Compatibilidad con distintas versiones de Pillow
@@ -158,95 +154,6 @@ def build_video_metadata(
         channel=channel_override or channel,
         source_url=source_url,
     )
-
-
-def youtube_ydl_base_opts(quiet: bool = False) -> Dict[str, Any]:
-    return {
-        "quiet": quiet,
-        "noplaylist": True,
-        "extractor_args": {
-            "youtube": {
-                "player_client": ["default"],
-            }
-        },
-    }
-
-
-def youtube_video_format(max_height: int = 1080) -> str:
-    return (
-        f"bestvideo[height<={max_height}][ext=mp4][vcodec^=avc1]/"
-        f"bestvideo[height<={max_height}][vcodec^=avc1]/"
-        f"bestvideo[height<={max_height}]/"
-        f"best[height<={max_height}][ext=mp4]/"
-        f"best[height<={max_height}]/"
-        "best[ext=mp4]/best"
-    )
-
-
-def metadata_from_yt_info(info: Dict[str, Any], fallback_url: str) -> VideoMetadata:
-    return build_video_metadata(
-        raw_title=info.get("title"),
-        channel=info.get("channel") or info.get("uploader"),
-        source_url=info.get("webpage_url") or fallback_url,
-    )
-
-
-def probe_youtube_metadata(url: str) -> Tuple[VideoMetadata, Optional[float]]:
-    if YoutubeDL is None:
-        raise RuntimeError("未安装 yt-dlp，请执行：pip install -r requirements.txt")
-
-    ydl_opts = youtube_ydl_base_opts(quiet=True)
-    ydl_opts["skip_download"] = True
-
-    with YoutubeDL(ydl_opts) as ydl:
-        info = ydl.extract_info(url, download=False)
-
-    return metadata_from_yt_info(info, url), info.get("duration")
-
-
-def download_video(
-    url: str,
-    output_dir: Path,
-    start_sec: float = 0.0,
-    end_sec: Optional[float] = None,
-    max_height: int = 1080,
-) -> Tuple[Path, VideoMetadata, float]:
-    """
-    Descarga un video desde YouTube usando yt-dlp.
-
-    Importante:
-    Como solo necesitamos frames, bajamos video sin audio. El recorte se hace
-    luego sobre el archivo local porque los range-downloads de YouTube pueden
-    quedarse colgados o devolver 403 en URLs de googlevideo.
-    """
-    if YoutubeDL is None:
-        raise RuntimeError("未安装 yt-dlp，请执行：pip install -r requirements.txt")
-
-    output_template = str(output_dir / "video.%(ext)s")
-
-    ydl_opts = youtube_ydl_base_opts(quiet=False)
-    ydl_opts.update({
-        "format": youtube_video_format(max_height=max_height),
-        "outtmpl": output_template,
-        "socket_timeout": 30,
-        "retries": 3,
-        "fragment_retries": 3,
-    })
-
-    with YoutubeDL(ydl_opts) as ydl:
-        info = ydl.extract_info(url, download=True)
-
-    candidates = []
-    for ext in ("mp4", "mkv", "webm", "mov"):
-        candidates.extend(output_dir.glob(f"video*.{ext}"))
-
-    if not candidates:
-        raise FileNotFoundError("未找到已下载的视频。")
-
-    candidates.sort(key=lambda p: p.stat().st_mtime, reverse=True)
-    metadata = metadata_from_yt_info(info, url)
-
-    return candidates[0], metadata, 0.0
 
 
 def is_bilibili_url(value: str) -> bool:
@@ -440,7 +347,7 @@ def create_blue_green_mask(
 
     # OpenCV HSV:
     # H va de 0 a 179.
-    # Estos rangos son deliberadamente amplios porque YouTube comprime y cambia tonos.
+    # Estos rangos son deliberadamente amplios porque la compresión de video cambia los tonos.
     blue_lower = np.array([80, 20, 50])
     blue_upper = np.array([145, 255, 255])
     blue_mask = cv2.inRange(hsv, blue_lower, blue_upper)
@@ -2067,7 +1974,7 @@ def main():
 
     parser.add_argument(
         "source",
-        help="URL de YouTube o ruta a archivo de video local",
+        help="Bilibili URL（BV/av 号）或 ruta a archivo de video local",
     )
 
     parser.add_argument(
@@ -2079,13 +1986,13 @@ def main():
     parser.add_argument(
         "--title",
         default=None,
-        help="Título a mostrar en la portada del PDF. Sobrescribe el título de YouTube.",
+        help="Título a mostrar en la portada del PDF. Sobrescribe el título del video.",
     )
 
     parser.add_argument(
         "--channel",
         default=None,
-        help="Canal o autor a mostrar en la portada del PDF. Sobrescribe el canal de YouTube.",
+        help="Canal o autor a mostrar en la portada del PDF. Sobrescribe el canal del video.",
     )
 
     parser.add_argument(
@@ -2250,20 +2157,17 @@ def main():
         comparison_dir = tmp_path / "comparison" if args.keep_comparison_images else None
 
         if source.startswith("http://") or source.startswith("https://"):
-            print("正在下载视频...")
-            video_path, metadata, downloaded_start_sec = download_video(
-                source,
-                tmp_path,
-                start_sec=args.start,
-                end_sec=args.end,
-            )
+            print("正在下载 Bilibili 视频...")
+            video_path = download_bilibili_video(source, tmp_path)
+            _meta, _duration = probe_bilibili_metadata(source)
             metadata = build_video_metadata(
-                raw_title=metadata.raw_title,
-                channel=metadata.channel,
-                source_url=metadata.source_url,
+                raw_title=_meta.raw_title,
+                channel=_meta.channel,
+                source_url=_meta.source_url,
                 title_override=args.title,
                 channel_override=args.channel,
             )
+            downloaded_start_sec = 0.0
         else:
             video_path = Path(source).resolve()
             if not video_path.exists():

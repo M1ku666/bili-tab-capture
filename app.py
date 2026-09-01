@@ -45,7 +45,6 @@ from tab_extractor import (
     normalize_bilibili_url,
     preprocess_for_detection,
     probe_bilibili_metadata,
-    probe_youtube_metadata,
     save_video_frame,
     split_into_measures,
     validate_crop_ratios,
@@ -120,7 +119,6 @@ APP_VERSION = current_version()
 
 ALLOWED_VIDEO_EXTENSIONS = {".mp4", ".mov", ".mkv", ".webm"}
 ALLOWED_IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".gif"}
-YOUTUBE_PREVIEW_MAX_HEIGHT = 480
 MIN_SPLIT_PX = 30  # 横向分割后每段的最小绝对像素高度（与前端保持一致）
 
 app = Flask(__name__)
@@ -227,10 +225,6 @@ def ensure_cache_dirs() -> None:
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
     for directory in (UPLOADS_DIR, PREVIEWS_DIR, RUNS_DIR):
         directory.mkdir(parents=True, exist_ok=True)
-
-
-def is_youtube_url(value: str) -> bool:
-    return value.startswith("http://") or value.startswith("https://")
 
 
 def metadata_to_dict(metadata: VideoMetadata) -> Dict[str, Optional[str]]:
@@ -363,6 +357,7 @@ def safe_pdf_name(value: str) -> str:
 
 
 def cached_remote_preview_video(source: Dict[str, Any]) -> Path:
+    # 仅 B 站远程源需要先下载再取帧；本地文件直接返回路径。
     preview_dir = PREVIEWS_DIR / source["id"] / "video"
     preview_dir.mkdir(parents=True, exist_ok=True)
 
@@ -373,12 +368,7 @@ def cached_remote_preview_video(source: Dict[str, Any]) -> Path:
     if source["type"] == "bilibili":
         return download_bilibili_video(source["url"], preview_dir, quality=16)
 
-    video_path, _metadata, _downloaded_start = download_video(
-        source["url"],
-        preview_dir,
-        max_height=YOUTUBE_PREVIEW_MAX_HEIGHT,
-    )
-    return video_path
+    raise RuntimeError(f"不支持的远程源类型：{source.get('type')}")
 
 
 def run_capture_job(job_id: str, payload: Dict[str, Any]) -> None:
@@ -434,22 +424,7 @@ def run_capture_job(job_id: str, payload: Dict[str, Any]) -> None:
             update_job(job_id, status="running", phase="downloading", updated_at=time.time())
 
             source_metadata = metadata_from_dict(source["metadata"])
-            if source["type"] == "youtube":
-                print("正在下载 YouTube 视频...")
-                video_path, downloaded_metadata, downloaded_start_sec = download_video(
-                    source["url"],
-                    download_dir,
-                    start_sec=start_sec,
-                    end_sec=end_sec,
-                )
-                metadata = build_video_metadata(
-                    raw_title=downloaded_metadata.raw_title,
-                    channel=downloaded_metadata.channel,
-                    source_url=downloaded_metadata.source_url,
-                    title_override=payload.get("title"),
-                    channel_override=payload.get("channel"),
-                )
-            elif source["type"] == "bilibili":
+            if source["type"] == "bilibili":
                 video_path = Path(source.get("video_path") or "")
                 if not video_path.exists():
                     print("正在下载 Bilibili 视频...")
@@ -741,7 +716,6 @@ def restore_images(state: Dict[str, Any]) -> List[Dict[str, Any]]:
 @app.post("/api/import")
 def import_source():
     ensure_cache_dirs()
-    youtube_url = (request.form.get("youtube_url") or "").strip()
     bvid = (request.form.get("bvid") or "").strip()
     upload = request.files.get("file")
 
@@ -779,18 +753,6 @@ def import_source():
                     args=(source_id, full_url, cache_dir, bvid_id or f"av{aid}"),
                     daemon=True,
                 ).start()
-        elif youtube_url:
-            if not is_youtube_url(youtube_url):
-                return json_error("请输入有效的 YouTube 链接。")
-            metadata, duration = probe_youtube_metadata(youtube_url)
-            source_id = uuid.uuid4().hex
-            source = {
-                "id": source_id,
-                "type": "youtube",
-                "url": youtube_url,
-                "metadata": metadata_to_dict(metadata),
-                "duration": duration,
-            }
         elif upload and upload.filename:
             original_name = secure_filename(upload.filename)
             suffix = Path(original_name).suffix.lower()
@@ -966,10 +928,7 @@ def preview_source():
         preview_name = f"{source['id']}_{int(time_sec * 1000)}_{uuid.uuid4().hex[:8]}.jpg"
         preview_path = PREVIEWS_DIR / preview_name
 
-        if source["type"] == "youtube":
-            video_path = cached_remote_preview_video(source)
-            save_video_frame(video_path, preview_path, time_sec=time_sec)
-        elif source["type"] == "bilibili":
+        if source["type"] == "bilibili":
             cached = Path(source.get("video_path") or "")
             if cached.exists():
                 video_path = cached
