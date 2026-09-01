@@ -35,6 +35,7 @@ echo [2/4] Building single-file exe ...
     --add-binary "%FFMPEG_EXE%;." ^
     --collect-submodules "cv2" ^
     --collect-submodules "curl_cffi" ^
+    --collect-submodules "qrcode" ^
     app.py || goto :error
 
 echo [3/4] Done.

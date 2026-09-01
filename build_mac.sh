@@ -90,6 +90,7 @@ mkdir -p build/.pyinstaller
     --add-binary "$FF:." \
     --collect-submodules "cv2" \
     --collect-submodules "curl_cffi" \
+    --collect-submodules "qrcode" \
     app.py
 
 echo "==> [5/5] 完成"
