@@ -1290,6 +1290,20 @@ function restoreLayout(layout) {
   if (typeof refreshResettableIcons === "function") refreshResettableIcons();
 }
 
+let showHiddenCards = true; // 顶部总开关：true=显示已隐藏(=现状)；false=列表里不显示 hidden 卡片
+
+// 依据总开关，隐藏或显示 hidden 卡片（仅视觉，不影响 hidden 状态与导出排除）。
+function applyHiddenVisibility() {
+  const cb = document.getElementById("showHiddenCheckbox");
+  if (cb) showHiddenCards = cb.checked;
+  els.cardList.querySelectorAll(".card").forEach((card) => {
+    const idx = Number(card.dataset.index);
+    const m = state.images[idx];
+    const canHide = m && m.hidden && !showHiddenCards;
+    card.classList.toggle("is-hidden-by-toggle", !!canHide);
+  });
+}
+
 function renderCardList() {
   numberMeasures();
   const scrollY = window.scrollY;
@@ -3655,4 +3669,26 @@ if (typeof els !== "undefined") {
     }
   }
   applyResetIconLater();
+}
+
+/* —— 显示/隐藏已隐藏图片 总开关 —— */
+const showHiddenCheckboxEl = document.getElementById("showHiddenCheckbox");
+if (showHiddenCheckboxEl) {
+  showHiddenCheckboxEl.addEventListener("change", () => {
+    showHiddenCards = showHiddenCheckboxEl.checked;
+    if (typeof refreshResettableIcons === "function") refreshResettableIcons();
+    if (typeof applyHiddenVisibility === "function") applyHiddenVisibility();
+  });
+}
+// 卡片列表 DOM 增删/重排等都会改变可见性；用 observer 兜底刷新隐藏态
+if (typeof els !== "undefined" && els.cardList && typeof applyHiddenVisibility === "function") {
+  let _hidBusy = false;
+  const _hidOv = new MutationObserver(() => {
+    if (_hidBusy) return;
+    _hidBusy = true;
+    requestAnimationFrame(() => {
+      try { applyHiddenVisibility(); } finally { _hidBusy = false; }
+    });
+  });
+  _hidOv.observe(els.cardList, { childList: true, subtree: true, attributes: true, attributeFilter: ["class"] });
 }

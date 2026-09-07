@@ -2221,3 +2221,22 @@ button:disabled {
   transform: scale(0.92);
 }
 .res-field .resetafter svg { width: 100%; height: 100%; display: block; fill: currentColor; }
+
+/* —— “显示已隐藏的图片”总开关 —— */
+.show-hidden-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  margin: 14px 0 0 2px;
+  font-size: 13px;
+  cursor: pointer;
+  user-select: none;
+}
+.show-hidden-toggle input[type="checkbox"] {
+  accent-color: var(--accent, #176b5b);
+  width: 15px;
+  height: 15px;
+  cursor: pointer;
+}
+/* 总开关关闭时，隐藏的卡片也从列表里视觉移除（不影响其 hidden 标记与导出排除）。 */
+.card.is-hidden-by-toggle { display: none !important; }
