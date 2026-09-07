@@ -33,7 +33,10 @@
     </header>
 
     <section class="panel import-panel" id="importPanel" aria-busy="false">
-      <h2 class="panel-title">导入</h2>
+      <div class="panel-title-row">
+        <h2 class="panel-title">导入</h2>
+        <a class="history-link" id="historyLink" href="javascript:void(0)" role="button" tabindex="0">历史记录</a>
+      </div>
       <form id="importForm" class="import-form">
         <div class="import-secondary-row">
           <label class="field file-field">
@@ -424,6 +427,32 @@
       <div class="modal-body login-modal-body">
         <img id="loginQrImage" alt="登录二维码">
         <span class="status-line" id="loginStatus"></span>
+      </div>
+    </div>
+  </div>
+
+  <div class="modal-overlay hidden" id="historyModal" role="presentation">
+    <div class="modal-card history-modal" role="dialog" aria-modal="true" aria-labelledby="historyModalTitle">
+      <div class="modal-header">
+        <span class="modal-title" id="historyModalTitle">历史记录</span>
+        <button class="modal-close" id="historyModalClose" type="button" aria-label="关闭">×</button>
+      </div>
+      <div class="modal-body history-body">
+        <div class="history-control-row">
+          <input id="historySearch" type="search" placeholder="搜索标题 / BV号" autocomplete="off">
+          <select id="historySort" aria-label="排序" autocomplete="off">
+            <option value="time-desc">时间从近到远</option>
+            <option value="time-asc">时间从远到近</option>
+            <option value="size-desc">占用从大到小</option>
+            <option value="size-asc">占用从小到大</option>
+          </select>
+        </div>
+        <div class="history-control-row grid-2-5">
+          <button type="button" class="secondary-button history-action-btn" id="historyToggleAll">全选</button>
+          <button type="button" class="danger-button history-action-btn" id="historyDeleteSelected">删除选中项</button>
+        </div>
+        <div class="history-list" id="historyList"></div>
+        <button class="back-to-top history-back-top" id="historyBackTop" type="button" aria-label="回到顶部">↑</button>
       </div>
     </div>
   </div>

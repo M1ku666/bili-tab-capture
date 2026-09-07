@@ -795,6 +795,11 @@ function applySource(source, mode /* '' | 'restore' | 'fresh' */) {
   }
   state.initialPreviewTime = state.duration ? Math.floor(Math.floor(state.duration) / 2) : 0;
 
+  // 第2步参数(若随源带回)覆盖以上默认，使“截图前”恢复可回填时间/阈值等
+  if (source && source.params2) {
+    try { applyStep2Params(source.params2); } catch (e) {}
+  }
+
   updateCropUi();
   updateTimeline();
 
@@ -854,19 +859,38 @@ async function clearPendingCache() {
   try {
     const cache = source.cache || {};
     if (source.id) {
-      // 先在服务端删除缓存目录/state
+      // 整目录删除（含下载视频/crops/params）。
       await fetchJson("/api/cache_clear", {
         method: "POST",
-        body: JSON.stringify({ type: cache.type, key: cache.key }),
+        body: JSON.stringify({ type: cache.type, key: cache.key, full: true }),
       });
     }
-    const fresh = Object.assign({}, source);
-    // 清除后当作“全新的该源”继续：服务端该 source 仍有效（cache_clear 不删内存），
-    // 去掉 restore/has_cache 即可开始新处理，无需回第一步重选文件。
-    delete fresh.restore;
-    delete fresh.has_cache;
+    // 目录已清空。旧 source 的 video_path/path 指向已被删的文件，不能再沿用。
+    //
+    // B 站：可网络重下 → 重新走一次导入，回到下载中/待截图。
+    // local/图片：原文件被连带删除、无法凭空复原 → 回到第 1 步让用户重新选。
+    if (cache.type === "bilibili" && cache.key) {
+      const fd = new FormData();
+      fd.append("bvid", cache.key);
+      els.cacheModal.classList.add("hidden");
+      const next = await fetchJson("/api/import", { method: "POST", body: fd });
+      applySource(next); // 下载中会走到进度，或重导完成进简介
+      setStatus(els.importStatus, "已清空缓存，正在重新下载该视频…", "success");
+      return;
+    }
+    // local / image
+    state.sourceId = null;
+    state.images = [];
+    state.captureJobId = null;
+    persistSnapshot = null;
+    state.maxStage = 1;
     els.cacheModal.classList.add("hidden");
-    applySource(fresh, "fresh");
+    els.localFile.value = "";
+    els.bvidInput.value = "";
+    updateFileHint();
+    setStage(1);
+    resetExtractionState();
+    setStatus(els.importStatus, "已清空该内容缓存；请重新选择文件导入。", "warning");
   } catch (error) {
     setStatus(els.importStatus, error.message || "清除缓存失败。", "error");
   } finally {
@@ -3692,3 +3716,317 @@ if (typeof els !== "undefined" && els.cardList && typeof applyHiddenVisibility =
   });
   _hidOv.observe(els.cardList, { childList: true, subtree: true, attributes: true, attributeFilter: ["class"] });
 }
+
+/* ===================== 历史记录弹窗 ===================== */
+const H = {
+  entries: [],
+  shown: [],
+  selected: new Set(),
+  sort: "time-desc",
+  q: "",
+  listeners: null,
+};
+
+const historyModal = document.getElementById("historyModal");
+const historyModalClose = document.getElementById("historyModalClose");
+const historyLink = document.getElementById("historyLink");
+const historySearch = document.getElementById("historySearch");
+const historySort = document.getElementById("historySort");
+const historyList = document.getElementById("historyList");
+const historyToggleAll = document.getElementById("historyToggleAll");
+const historyDelete = document.getElementById("historyDeleteSelected");
+
+function fmtSize(n) {
+  if (!Number.isFinite(n) || n < 0) return "-";
+  if (n < 1024) return n + " B";
+  if (n < 1024 * 1024) return (n / 1024).toFixed(1) + " KB";
+  if (n < 1024 * 1024 * 1024) return (n / (1024 * 1024)).toFixed(1) + " MB";
+  return (n / (1024 * 1024 * 1024)).toFixed(2) + " GB";
+}
+
+function sortEntries(a, b) {
+  const k = H.sort.split("-")[0];
+  const dir = H.sort.endsWith("asc") ? 1 : -1;
+  if (k === "size") return (a.size - b.size) * dir;
+  return (a.mtime - b.mtime) * dir || 0;
+}
+
+function coverKey(kind, key) { return kind + "::" + key; }
+
+function applySelectionVisible() {
+  H.shown.forEach((e) => {
+    const row = historyList.querySelector(`.history-row[data-k="${coverKey(e.kind, e.key)}"]`);
+    if (!row) return;
+    const cb = row.querySelector('input[type="checkbox"]');
+    if (cb) cb.checked = H.selected.has(coverKey(e.kind, e.key));
+  });
+  const allOn = H.shown.length > 0 && H.shown.every((e) => H.selected.has(coverKey(e.kind, e.key)));
+  historyToggleAll.textContent = allOn ? "取消全选" : "全选";
+}
+
+function renderHistory() {
+  H.entries.map((e) => ({ e, sortKey: coverKey(e.kind, e.key) }));
+  historyList.innerHTML = "";
+  const q = (H.q || "").trim().toLowerCase();
+  H.shown = H.entries
+    .filter((e) => {
+      if (!q) return true;
+      const hay = `${e.title} ${e.key} ${e.channel}`.toLowerCase();
+      return hay.includes(q);
+    })
+    .slice()
+    .sort(sortEntries);
+  if (!H.shown.length) {
+    historyList.innerHTML = '<div class="empty-history">暂无历史记录</div>';
+    return;
+  }
+
+  H.shown.forEach((e) => {
+    const row = document.createElement("div");
+    row.className = "history-row" + (e.resumable === false ? " disabled" : "");
+    row.dataset.k = coverKey(e.kind, e.key);
+
+    const img = document.createElement("img");
+    img.className = "hist-img";
+    img.alt = "";
+    img.loading = "lazy";
+    img.src = `/api/history/cover?kind=${e.kind}&key=${encodeURIComponent(e.key)}`;
+    img.onerror = () => { img.style.visibility = "hidden"; };
+
+    const info = document.createElement("div");
+    info.className = "hist-info";
+    const t = document.createElement("div");
+    t.className = "hist-t";
+    t.title = e.title || e.key;
+    t.textContent = e.title || e.key;
+    const timeLine = document.createElement("div");
+    timeLine.className = "hist-time";
+    timeLine.textContent = new Date(e.mtime * 1000).toLocaleString();
+    const sizeLine = document.createElement("div");
+    sizeLine.className = "hist-size";
+    sizeLine.textContent = `占用 ${fmtSize(e.size)}`;
+    info.appendChild(t);
+    info.appendChild(timeLine);
+    info.appendChild(sizeLine);
+
+    const check = document.createElement("input");
+    check.type = "checkbox";
+    check.className = "hist-check";
+    check.checked = H.selected.has(row.dataset.k);
+    check.addEventListener("click", (ev) => {
+      ev.stopPropagation();
+      const k = row.dataset.k;
+      if (check.checked) H.selected.add(k); else H.selected.delete(k);
+      applySelectionVisible();
+    });
+
+    row.appendChild(check);
+    row.appendChild(img);
+    row.appendChild(info);
+    if (e.resumable === true || e.resumable === undefined) {
+      row.addEventListener("click", () => restoreHistory(e));
+    } else {
+      row.addEventListener("click", (ev) => {
+        ev.stopPropagation();
+        showToast("此记录的源文件缺失，无法恢复。","error");
+      });
+    }
+    historyList.appendChild(row);
+  });
+  applySelectionVisible();
+}
+
+async function loadHistory() {
+  try {
+    const data = await fetchJson("/api/history");
+    H.entries = data.entries || [];
+    renderHistory();
+  } catch (err) {
+    showToast(err.message || "读取历史失败。", "error");
+  }
+}
+
+function openHistoryModal() {
+  historyModal.classList.remove("hidden");
+  loadHistory();
+}
+function closeHistoryModal() {
+  historyModal.classList.add("hidden");
+}
+async function restoreHistory(entry) {
+  if (entry && entry.resumable === false) {
+    showToast("此记录源文件缺失，无法恢复。","error");
+    return;
+  }
+  try {
+    historyModal.classList.add("hidden");
+    const source = await fetchJson("/api/history/restore", {
+      method: "POST",
+      body: JSON.stringify({ kind: entry.kind, key: entry.key }),
+    });
+    applySource(source, "restore");
+    setStatus(els.importStatus, "已从历史记录恢复进度。", "success");
+  } catch (err) {
+    showToast(err.message || "恢复失败。","error");
+  }
+}
+async function deleteSelectedHistory() {
+  const items = [];
+  H.selected.forEach((k) => {
+    const [kind, key] = k.split("::");
+    if (kind && key) items.push({ kind, key });
+  });
+  if (!items.length) {
+    showToast("请先勾选要删除的条目。","error");
+    return;
+  }
+  // 勾选条目的大小总和（复用已从后端拿到的 size）
+  let sum = 0;
+  H.selected.forEach((k) => {
+    const [kind, key] = k.split("::");
+    const hit = H.entries.find((e) => e.kind === kind && e.key === key);
+    if (hit && Number.isFinite(hit.size)) sum += hit.size;
+  });
+  const ok = window.confirm(
+    `删除 ${items.length} 项，共 ${fmtSize(sum)}，此操作不可撤销！`
+  );
+  if (!ok) return;
+  try {
+    const r = await fetchJson("/api/history/delete", {
+      method: "POST",
+      body: JSON.stringify({ items }),
+    });
+    H.selected = new Set();
+    showToast(`已删除 ${(r && r.removed) || 0} 条。`, "success");
+    loadHistory();
+  } catch (err) {
+    showToast(err.message || "删除失败。", "error");
+  }
+}
+function toggleAllHistory() {
+  const shouldSelect = !(H.shown.length > 0 && H.shown.every((e) => H.selected.has(coverKey(e.kind, e.key))));
+  if (shouldSelect) H.shown.forEach((e) => H.selected.add(coverKey(e.kind, e.key)));
+  else H.shown.forEach((e) => H.selected.delete(coverKey(e.kind, e.key)));
+  renderHistory();
+}
+
+if (historyLink) {
+  historyLink.addEventListener("click", openHistoryModal);
+  historyLink.addEventListener("keydown", (e) => {
+    if (e.key === "Enter" || e.key === " ") { e.preventDefault(); openHistoryModal(); }
+  });
+}
+if (historyModalClose) historyModalClose.addEventListener("click", closeHistoryModal);
+if (historyModal) historyModal.addEventListener("click", (e) => { if (e.target === historyModal) closeHistoryModal(); });
+if (historySearch) historySearch.addEventListener("input", () => { H.q = historySearch.value; renderHistory(); });
+if (historySort) historySort.addEventListener("change", () => { H.sort = historySort.value; renderHistory(); });
+if (historyToggleAll) historyToggleAll.addEventListener("click", toggleAllHistory);
+if (historyDelete) historyDelete.addEventListener("click", deleteSelectedHistory);
+
+/* —— 历史弹窗：在滚动列表出现时显示“回到顶部” —— */
+const historyBackTop = document.getElementById("historyBackTop");
+function _syncHistoryBackTop() {
+  if (!historyList || !historyBackTop) return;
+  historyBackTop.classList.toggle("is-visible", historyList.scrollTop > 100);
+}
+if (historyList) { historyList.addEventListener("scroll", _syncHistoryBackTop); }
+if (historyBackTop) {
+  historyBackTop.addEventListener("click", () => {
+    historyList.scrollTo({ top: 0, behavior: "smooth" });
+  });
+}
+
+/* ============ 第 2 步截图参数：改动即持久(供“截图前”也能恢复) ============ */
+const STEP2_PARAM_IDS = [
+  "startMinInput", "startSecInput", "endMinInput", "endSecInput",
+  "sampleEvery", "diffThreshold", "bandHalfWidth", "compareWindow",
+  "tolerance", "softness",
+];
+
+function collectStep2Params() {
+  const o = {};
+  const num = (id, dflt) => {
+    const el = document.getElementById(id);
+    if (!el || el.value === "" || el.value == null) return dflt;
+    const v = Number(el.value);
+    return Number.isFinite(v) ? v : dflt;
+  };
+  const start = parseInt(elOf("startMinInput") ? (els.startMinInput.value || "0") : "0", 10) * 60 +
+    parseInt((els.startSecInput && els.startSecInput.value) || "0", 10);
+  const endM = els.endMinInput && els.endMinInput.value !== "" ? Number(els.endMinInput.value) : null;
+  const endS = els.endSecInput && els.endSecInput.value !== "" ? Number(els.endSecInput.value) : null;
+  o.startSeconds = start;
+  o.endSeconds = (endM != null && endS != null) ? endM * 60 + endS : null;
+  o.sample_every = num("sampleEvery", 2);
+  o.diff_threshold = num("diffThreshold", 0.01);
+  o.band_half_width = num("bandHalfWidth", 90);
+  o.compare_window = num("compareWindow", 1);
+  o.tolerance = num("tolerance", 300);
+  o.softness = num("softness", 90);
+  // 抽帧前裁剪框归一化比率
+  o.cropStart = (state && typeof state.cropStart==="number") ? state.cropStart : 0;
+  o.cropEnd = (state && typeof state.cropEnd==="number") ? state.cropEnd : 1;
+  o.cropLeft = (state && typeof state.cropLeft==="number") ? state.cropLeft : 0;
+  o.cropRight = (state && typeof state.cropRight==="number") ? state.cropRight : 1;
+  return o;
+}
+function elOf(id){ return document.getElementById(id); }
+
+function applyStep2Params(params) {
+  if (!params || typeof params !== "object") return;
+  const mins = Math.floor(params.startSeconds / 60);
+  const secs = Math.round(params.startSeconds - mins * 60);
+  if (els.startMinInput) els.startMinInput.value = String(mins);
+  if (els.startSecInput) els.startSecInput.value = String(secs);
+  if (params.endSeconds != null && els.endMinInput && els.endSecInput) {
+    const em = Math.floor(params.endSeconds / 60);
+    els.endMinInput.value = String(em);
+    els.endSecInput.value = String(Math.round(params.endSeconds - em * 60));
+  }
+  const set = (id, v) => { const e = elOf(id); if (e && v != null) e.value = String(v); };
+  set("sampleEvery", params.sample_every);
+  set("diffThreshold", params.diff_threshold);
+  set("bandHalfWidth", params.band_half_width);
+  set("compareWindow", params.compare_window);
+  set("tolerance", params.tolerance);
+  set("softness", params.softness);
+  // 抽帧前裁剪框
+  const numOr=(v,d)=>(
+    v == null || !Number.isFinite(Number(v)) ? d : Number(v)
+  );
+  if (params.cropStart != null) state.cropStart = numOr(params.cropStart,0);
+  if (params.cropEnd != null) state.cropEnd = numOr(params.cropEnd,1);
+  if (params.cropLeft != null) state.cropLeft = numOr(params.cropLeft,0);
+  if (params.cropRight != null) state.cropRight = numOr(params.cropRight,1);
+  try { if (typeof updateCropUi==='function') updateCropUi(); } catch(e){}
+}
+
+let __step2Timer = null;
+function persistStep2Params() {
+  if (!state.sourceId) return;
+  clearTimeout(__step2Timer);
+  __step2Timer = setTimeout(() => {
+    const params = collectStep2Params();
+    fetchJson("/api/save_capture_prefs", {
+      method: "POST",
+      body: JSON.stringify({ source_id: state.sourceId, params }),
+    }).catch(() => {});
+  }, 600);
+}
+
+/**** 接线 ****/
+(function wireStep2Params(){
+  if (typeof els === "undefined") return;
+  const on = (id) => {
+    const e = elOf(id);
+    if (!e) return;
+    e.addEventListener("input", persistStep2Params);
+    e.addEventListener("change", persistStep2Params);
+  };
+  STEP2_PARAM_IDS.forEach(on);
+})();
+
+// 裁剪框拖动(pointermove 更新 crop)结束后触发一次第2步参数保存
+document.addEventListener("pointerup", () => {
+  if (state && state.sourceId && typeof persistStep2Params === "function") persistStep2Params();
+});

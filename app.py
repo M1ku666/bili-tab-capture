@@ -87,9 +87,16 @@ def _cache_clearable(cache_dir: Path) -> bool:
 
 
 def has_restorable_cache(cache_dir: Path, state: Optional[Dict[str, Any]] = None) -> bool:
-    """有可恢复的截图/裁剪才算命中：state 含 captures 且对应 png 存在。"""
+    """是否有可“恢复进度”的内容 = 截图(captures+png) 或 保存过的第2步参数(params2)。
+
+    截图前若只调过第2步参数(写进 params2)也算命中，导回时可弹“恢复/从新开始”。
+    """
     if state is None:
         state = load_state_json(cache_dir)
+    return _has_images(cache_dir, state) or _has_params(state)
+
+
+def _has_images(cache_dir: Path, state: Optional[dict]) -> bool:
     if not state or not state.get("captures"):
         return False
     crops = cache_dir / "crops"
@@ -97,6 +104,15 @@ def has_restorable_cache(cache_dir: Path, state: Optional[Dict[str, Any]] = None
     if not files:
         return False
     return any((crops / (f.get("file") or "")).exists() for f in files)
+
+
+def _has_params(state: Optional[dict]) -> bool:
+    if not state:
+        return False
+    p2 = state.get("params2")
+    return isinstance(p2, dict) and any(
+        p2.get(k) not in (None, PARAMS2_DEFAULTS.get(k)) for k in p2
+    )
 
 
 def load_state_json(cache_dir: Path) -> Optional[Dict[str, Any]]:
@@ -785,6 +801,8 @@ def import_source():
             source_id = uuid.uuid4().hex
             bvid_id, aid = extract_bilibili_id(full_url)
             cache_dir = bilibili_cache_dir(bvid_id or f"av{aid}")
+            # 提前写占位 state(含标题等元数据)：即使只下载还没截图，也让历史记录能看到该目录
+            ensure_placeholder_state(cache_dir, metadata_to_dict(metadata))
             source = {
                 "id": source_id,
                 "type": "bilibili",
@@ -796,15 +814,20 @@ def import_source():
             }
             state = load_state_json(cache_dir)
             cached_video = find_video_file(cache_dir)
-            if state is not None and state.get("captures"):
-                job_id = make_cached_job(source_id, cache_dir, state)
-                source["restore"] = {"job_id": job_id, "images": restore_images(state), "layout": state.get("layout"), "maxStage": state.get("maxStage")}
-                source["download"]["status"] = "done"
-                # 命中可恢复缓存：交由前端弹窗让用户选“恢复进度/清除缓存”。
+            has_img = _has_images(cache_dir, state)
+            has_par = _has_params(state)
+            if has_img or has_par:
+                # 有可恢复进度(截图或只存过第2步参数)即命中：交前端弹窗选“恢复/从新开始”。
                 source["has_cache"] = True
                 source["cache"] = {"cache_dir": str(cache_dir), "type": "bilibili", "key": bvid_id or f"av{aid}", "title": metadata.display_title or metadata.raw_title}
+                source["params2"] = read_capture_prefs(state)
                 if cached_video is not None:
+                    source["download"]["status"] = "done"
                     source["video_path"] = str(cached_video)
+                if has_img:
+                    job_id = make_cached_job(source_id, cache_dir, state)
+                    source["restore"] = {"job_id": job_id, "images": restore_images(state), "layout": state.get("layout"), "maxStage": state.get("maxStage")}
+                    source["download"]["status"] = "done"
             elif cached_video is not None:
                 source["video_path"] = str(cached_video)
                 source["download"]["status"] = "done"
@@ -887,6 +910,8 @@ def import_source():
                 file_hash = hash_file(saved_path)
                 cache_dir = local_cache_dir(file_hash)
                 cache_dir.mkdir(parents=True, exist_ok=True)
+                # 提前占位 state：导入本地视频即写（即使未截图，历史也可见标题）
+                ensure_placeholder_state(cache_dir, metadata_to_dict(metadata))
                 cached_video = cache_dir / f"video{suffix}"
                 if cached_video.exists():
                     saved_path.unlink(missing_ok=True)
@@ -903,13 +928,16 @@ def import_source():
                     "video_path": str(cached_video),
                 }
                 state = load_state_json(cache_dir)
-                if state is not None and state.get("captures"):
-                    job_id = make_cached_job(source_id, cache_dir, state)
-                    source["restore"] = {"job_id": job_id, "images": restore_images(state), "layout": state.get("layout"), "maxStage": state.get("maxStage")}
-                    # 命中可恢复缓存：交由前端弹窗让用户选“恢复进度/清除缓存”。
+                has_img = _has_images(cache_dir, state)
+                has_par = _has_params(state)
+                if has_img or has_par:
                     source["has_cache"] = True
                     source["cache"] = {"cache_dir": str(cache_dir), "type": "local", "key": file_hash,
                                        "title": metadata.display_title or metadata.raw_title}
+                    source["params2"] = read_capture_prefs(state)
+                    if has_img:
+                        job_id = make_cached_job(source_id, cache_dir, state)
+                        source["restore"] = {"job_id": job_id, "images": restore_images(state), "layout": state.get("layout"), "maxStage": state.get("maxStage")}
             else:
                 return json_error("不支持的文件格式，请使用视频（mp4/mov/mkv/webm）或图片（png/jpg/webp/bmp/gif）。")
         else:
@@ -942,14 +970,17 @@ def source_download_status(source_id: str):
 
 @app.post("/api/cache_clear")
 def cache_clear():
-    """按导入类型清除该源的缓存（截图/裁剪进度）。
+    """按导入类型清除该源的缓存（截图/裁剪进度；可选整目录删除）。
 
-    参数：type ∈ {bilibili, local, image}；key = bvid | 哈希。
+    参数：type ∈ {bilibili, local, image}；key = bvid | 哈希；
+        full=true -> 整缓存目录全部删除（“从新开始”），
+        否则只清 crops+state(仍保留下载好的视频等)。
     仅允许删除 CACHE/bv、/local、/img 下的已知目录。
     """
     payload = request.get_json(force=True, silent=True) or {}
     kind = payload.get("type")
     key = (payload.get("key") or "").strip()
+    full = bool(payload.get("full"))
     safe_key = Path(key).name if key else ""
     if not safe_key or safe_key != key.rsplit("/", 1)[-1].rsplit("\\", 1)[-1]:
         return json_error("非法 key。", 400)
@@ -964,11 +995,388 @@ def cache_clear():
     if not _cache_clearable(cache_dir):
         return json_error("不允许清除该目录。", 403)
 
+    if full:
+        import shutil as _sh
+        _sh.rmtree(cache_dir, ignore_errors=True)
+        cache_dir.mkdir(parents=True, exist_ok=True)   # 保留空目录让后续照常写入
+        return jsonify({"ok": True})
+
     for old in (cache_dir / "crops").glob("*.png"):
         old.unlink(missing_ok=True)
     (cache_dir / "state.json").unlink(missing_ok=True)
     # 注意：不清除 SOURCES/JOBS 里的内存 source——用户“从新开始”后仍要沿用同一个
     # source 继续处理当前文件，只是不再命中旧缓存。
+    return jsonify({"ok": True})
+
+
+# --------------------------------------------------------------------------
+# 历史记录（bv/img/local 持久缓存里可恢复的条目）
+# --------------------------------------------------------------------------
+_CACHE_KIND_DIR = {
+    "bilibili": "bv",
+    "image": "img",
+    "local": "local",
+}
+_CACHE_DIR_BY_KIND = {
+    "bilibili": bilibili_cache_dir,
+    "image": image_cache_dir,
+    "local": local_cache_dir,
+}
+_FILENAME_RE = re.compile(r"[^A-Za-z0-9._-]")
+
+
+def _pick_cover_image(cache_dir: Path, state: Optional[Dict] = None) -> Optional[Path]:
+    """挑选用于列表封面的本地 PNG：优先 state.images[0].file 所在 crops，否则 crops 里第一张。"""
+    if state is None:
+        state = load_state_json(cache_dir)
+    crops = cache_dir / "crops"
+    name = None
+    if state:
+        first_img = (state.get("images") or [{}])[0]
+        name = first_img.get("file")
+        if not name:
+            first_cap = (state.get("captures") or [{}])[0]
+            name = first_cap.get("file")
+    if name:
+        p = crops / name
+        if p.exists():
+            return p
+    st = sorted(crops.glob("*.png"), key=lambda q: q.stat().st_ctime if q.exists() else 0)
+    st += sorted(crops.glob("import.png"), key=lambda q: 0)  # import already covered
+    for cand in sorted(crops.glob("*.png"), key=lambda q: q.name):
+        if cand.exists():
+            return cand
+    return None
+
+
+def _dir_size(p: "Path") -> int:
+    total = 0
+    try:
+        for f in p.rglob("*"):
+            if f.is_file():
+                total += f.stat().st_size
+    except OSError:
+        pass
+    return total
+
+
+# 第 2 步截图参数默认(旧版缓存无这些时也应回退)  —— 前向兼容
+PARAMS2_DEFAULTS = {
+    "startSeconds": 0.0,
+    "endSeconds": None,
+    "sample_every": 2.0,
+    "diff_threshold": 0.01,
+    "band_half_width": 90,
+    "compare_window": 1,
+    "tolerance": 300.0,
+    "softness": 90.0,
+    "coeff_horizontal": 0.7,
+    "coeff_vertical": 0.8,
+    "stitch_max_width": 600,
+    # 抽帧前裁切(第2步裁剪框)归一化比率
+    "cropStart": 0.0,
+    "cropEnd": 1.0,
+    "cropLeft": 0.0,
+    "cropRight": 1.0,
+}
+
+
+def read_capture_prefs(state: Optional[dict]) -> dict:
+    """把 state.params2 与该类型参数默认合并，缺失字段回退默认(兼容旧版)."""
+    prefs = dict(PARAMS2_DEFAULTS)
+    if state and isinstance(state.get("params2"), dict):
+        for k, v in state["params2"].items():
+            if k in prefs and v is not None:
+                prefs[k] = v
+    return prefs
+
+
+def ensure_placeholder_state(cache_dir: Path, metadata: Dict[str, Any], params: Optional[dict] = None) -> bool:
+    """若该 cache 目录还没有 state，写占位 state 并(可选)埋伏 params2(第2步可恢复)."""
+    pfile = cache_dir / "state.json"
+    if pfile.exists():
+        return False
+    save_state_json(
+        cache_dir,
+        {
+            "captures": [],
+            "images": [],
+            "capture_params": {},
+            "metadata": metadata,
+            "layout": None,
+            "maxStage": None,
+            **({"params2": params} if params else {}),
+        },
+    )
+    return True
+
+
+def _entry_title(state: Optional[Dict]) -> str:
+    if not state:
+        return ""
+    md = state.get("metadata") or {}
+    return md.get("display_title") or md.get("raw_title") or ""
+
+
+def _history_entries():
+    """遍历 bv/img/local 中所有子目录，每条一律作为一条历史。
+
+    该功能用于“管理本地存储占用”，因此不能像按 state.json 存在与否来筛——
+    即使只下载好视频、还没走到截图/写 state，也应列出（那常是最占空间的）。
+    """
+    out = []
+    for kind, sub in _CACHE_KIND_DIR.items():
+        base = CACHE_DIR / sub
+        if not base.exists():
+            continue
+        for cd in sorted(base.iterdir()):
+            if not cd.is_dir():
+                continue
+            key = cd.name
+            state = load_state_json(cd)  # 可能为空
+            meta = (state or {}).get("metadata") or {}
+            title = _entry_title(state) or key
+            chnl = meta.get("channel") or ""
+            kind_label = {"bilibili": "B站视频", "image": "图片", "local": "本地视频"}.get(kind, kind)
+            mg = (state or {}).get("maxStage") if state else None
+
+            def _playable(directory: Path, exts=(".mp4", ".mkv", ".webm", ".mov")):
+                for p in directory.iterdir():
+                    if p.is_file() and p.name.lower().endswith(exts):
+                        return p
+                return None
+
+            resumable = False
+            if kind in ("local", "bilibili"):
+                # 能提供可播放文件即可继续(无论是否有截图 state)
+                resumable = bool(_playable(cd)) or bool(state and state.get("captures"))
+            elif kind == "image":
+                master = next((p for p in cd.iterdir()
+                               if p.is_file() and p.name.lower().startswith("master")), None)
+                resumable = bool(master) or bool(state and state.get("captures"))
+            out.append({
+                "kind": kind,          # bilibili|image|local
+                "label": kind_label,
+                "key": key,            # bvid/hash
+                "title": title,
+                "channel": chnl,
+                "mtime": float(cd.stat().st_mtime) if cd.exists() else 0.0,
+                "size": _dir_size(cd),
+                "resumable": resumable,
+                "stage": mg or 0,
+            })
+    out.sort(key=lambda e: e["mtime"], reverse=True)
+    return out
+
+
+@app.get("/api/history")
+def api_history():
+    return jsonify({"entries": _history_entries()})
+
+
+import time as _time  # noqa
+
+_BILI_COVER_CACHE = {}      # bvid -> (ts, bytes)
+_BILI_COVER_TTL = 600      # 秒
+
+
+def _bilibili_real_cover(key: str) -> Optional[bytes]:
+    """拉取 B 站视频真实封面(pic)到内存(短 TTL)。失败返回 None。"""
+    import time as _t
+    now = _t.time()
+    cached = _BILI_COVER_CACHE.get(key)
+    if cached and now - cached[0] < _BILI_COVER_TTL:
+        return cached[1]
+    try:
+        import bili as _bili
+        url = "https://api.bilibili.com/x/web-interface/view?bvid=" + key
+        r = _bili._session.get(url, timeout=8)
+        r.raise_for_status()
+        pic = (r.json().get("data") or {}).get("pic")
+        if not pic:
+            return None
+        pr = _bili._session.get(pic, timeout=8,
+                                headers={"Referer": "https://www.bilibili.com/"})
+        pr.raise_for_status()
+        content = pr.content
+        if content:
+            _BILI_COVER_CACHE[key] = (now, content)
+            if len(_BILI_COVER_CACHE) > 200:
+                _BILI_COVER_CACHE.clear()
+            return content
+    except Exception:
+        pass
+    return None
+
+
+@app.get("/api/history/cover")
+def api_history_cover():
+    kind = request.args.get("kind") or ""
+    key = request.args.get("key") or ""
+    safe_key = Path(key).name if key else ""
+    if kind not in _CACHE_DIR_BY_KIND or not safe_key:
+        return json_error("参数错误。", 400)
+    cache_dir = _CACHE_DIR_BY_KIND[kind](safe_key)
+    if not _cache_clearable(cache_dir):
+        return json_error("不允许访问该目录。", 403)
+
+    # B 站用真实封面(pic)优先；失败或非 bilibili 退回本地首帧。
+    if kind == "bilibili":
+        real = _bilibili_real_cover(safe_key)
+        if real:
+            from flask import Response
+            return Response(real, mimetype="image/jpeg")
+
+    cover = _pick_cover_image(cache_dir)
+    if not cover:
+        return json_error("没有封面。", 404)
+    return send_file(str(cover), mimetype="image/png")
+
+
+@app.post("/api/history/delete")
+def api_history_delete():
+    """多选/全选删除：删除选中的 cache 目录(bv/img/local 之一)。"""
+    payload = request.get_json(force=True, silent=True) or {}
+    items = payload.get("items") or []
+    removed = 0
+    for it in items:
+        kind = (it or {}).get("kind")
+        key = (it or {}).get("key") or ""
+        safe_key = Path(key).name if isinstance(key, str) else ""
+        if kind not in _CACHE_DIR_BY_KIND or not safe_key:
+            continue
+        cache_dir = _CACHE_DIR_BY_KIND[kind](safe_key)
+        if not _cache_clearable(cache_dir):
+            continue
+        try:
+            import shutil as _sh
+            with STORE_LOCK:
+                for sid, src in list(SOURCES.items()):
+                    if Path(str(src.get("cache_dir") or "")).resolve() == cache_dir.resolve():
+                        SOURCES.pop(sid, None)
+                for jid, job in list(JOBS.items()):
+                    if Path(str(job.get("cache_dir") or "")).resolve() == cache_dir.resolve():
+                        JOBS.pop(jid, None)
+            _sh.rmtree(cache_dir, ignore_errors=True)
+            removed += 1
+        except OSError:
+            continue
+    return jsonify({"removed": removed})
+
+
+@app.post("/api/history/restore")
+def api_history_restore():
+    """按 cache 类型/键重建 source 返回。
+
+    有 state(可恢复截图/裁剪) 时带 .restore；否则(如只下载好视频还没截图)只返回
+    基础 source(前端当作“继续/新开始”处理，走到截图步骤)。此功能管理本地占用，
+    故“无截图但有原文件”也能打开继续。
+    """
+    payload = request.get_json(force=True, silent=True) or {}
+    kind = payload.get("kind") or ""
+    key = (payload.get("key") or "").strip()
+    safe_key = Path(key).name if key else ""
+    if kind not in _CACHE_DIR_BY_KIND or not safe_key:
+        return json_error("参数错误。", 400)
+    cache_dir = _CACHE_DIR_BY_KIND[kind](safe_key)
+    if not _cache_clearable(cache_dir):
+        return json_error("不允许访问该目录。", 403)
+
+    state = load_state_json(cache_dir)
+    has_images = bool(state and (state.get("captures") or state.get("images")))
+    meta = (state or {}).get("metadata") or {}
+
+    source_id = uuid.uuid4().hex
+    if kind == "bilibili":
+        fid = next((p for p in cache_dir.iterdir()
+                    if p.is_file() and p.name.lower().endswith((".mp4", ".mkv", ".webm", ".mov"))), None)
+        try:
+            dl = get_video_duration(fid) if fid is not None else None
+        except Exception:
+            dl = None
+        source = {
+            "id": source_id, "type": "bilibili",
+            "url": meta.get("source_url") or f"https://www.bilibili.com/video/{safe_key}",
+            "metadata": meta,
+            "duration": dl,
+            "cache_dir": str(cache_dir),
+            "download": {"status": "done", "message": None},
+        }
+        if fid:
+            source["video_path"] = str(fid)
+    elif kind == "image":
+        master = next((p for p in cache_dir.iterdir()
+                       if p.is_file() and p.name.lower().startswith("master")), None)
+        source = {
+            "id": source_id, "type": "image",
+            "path": str(master) if master else (next((p for p in cache_dir.iterdir()
+                                                      if p.is_file() and p.suffix.lower() in (".png", ".jpg", ".jpeg")), None)),
+            "metadata": meta, "duration": None,
+            "cache_dir": str(cache_dir),
+            "download": {"status": "done", "message": None},
+        }
+        if not source["path"]:
+            return json_error("图片原文件缺失。", 404)
+        if not has_images:
+            # 无截图态：走 /start_image_capture 前前端会直接读原图
+            has_images = False
+    else:  # local
+        vid = next((p for p in cache_dir.iterdir()
+                    if p.is_file() and p.name.lower().endswith((".mp4", ".mkv", ".webm", ".mov"))), None)
+        if not vid:
+            return json_error("本地视频文件缺失。", 404)
+        try:
+            dl = get_video_duration(vid)
+        except Exception:
+            dl = None
+        source = {
+            "id": source_id, "type": "local", "path": str(vid),
+            "metadata": meta, "duration": dl, "cache_dir": str(cache_dir),
+            "download": {"status": "done", "message": None}, "video_path": str(vid),
+        }
+
+    if has_images:
+        job_id = make_cached_job(source_id, cache_dir, state)
+        source["restore"] = {
+            "job_id": job_id,
+            "images": restore_images(state),
+            "layout": (state or {}).get("layout"),
+            "maxStage": (state or {}).get("maxStage"),
+        }
+    # 截图参数(第2步)一并带出（含占位/旧版无则回退默认）
+    source["params2"] = read_capture_prefs(state)
+    with STORE_LOCK:
+        SOURCES[source_id] = source
+    return jsonify(source)
+
+
+@app.post("/api/save_capture_prefs")
+def api_save_capture_prefs():
+    """第 2 步(截图)参数变动即存——无需已生成截图，让“截图前”也能恢复进度。"""
+    payload = request.get_json(force=True, silent=True) or {}
+    source_id = payload.get("source_id")
+    if not source_id:
+        return json_error("缺少 source_id。", 400)
+    with STORE_LOCK:
+        src = SOURCES.get(source_id)
+    if not src:
+        return json_error("未知的视频源。", 404)
+    cache_dir_str = src.get("cache_dir")
+    if not cache_dir_str:
+        return json_error("该源无缓存目录。", 409)
+    cache_dir = Path(cache_dir_str)
+
+    allowed = set(PARAMS2_DEFAULTS.keys())
+    params = (payload.get("params") or {})
+    clean = {k: v for k, v in params.items() if k in allowed}
+    state = load_state_json(cache_dir) or {
+        "captures": [], "images": [], "capture_params": {},
+        "metadata": src.get("metadata") or {},
+    }
+    state["params2"] = clean
+    if "maxStage" not in state or state.get("maxStage") in (None, 0):
+        state["maxStage"] = 2
+    save_state_json(cache_dir, state)
     return jsonify({"ok": True})
 
 

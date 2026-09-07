@@ -10,6 +10,7 @@
   --accent-strong: #0f4e43;
   --warn: #b65f22;
   --danger: #a3362f;
+  --danger-strong: #8b2d26;
   --success: #2d6a3f;
   --shadow: 0 12px 36px rgba(32, 37, 45, 0.10);
   --card-strip-h: 32px;
@@ -2240,3 +2241,215 @@ button:disabled {
 }
 /* 总开关关闭时，隐藏的卡片也从列表里视觉移除（不影响其 hidden 标记与导出排除）。 */
 .card.is-hidden-by-toggle { display: none !important; }
+
+/* 导入面板标题行 */
+.panel-title-row { display: flex; align-items: center; justify-content: space-between; margin-bottom: 6px; }
+.panel-title-row .panel-title { margin: 0; }
+.history-link { font-size: 13px; cursor: pointer; color: var(--accent); text-decoration: underline; }
+
+/* 历史弹窗：固定高度，列表区自行滚动（不随条目数增高） */
+.history-modal .modal-card {
+  max-width: 720px;
+  width: 92vw;
+  max-height: min(86vh, 720px);
+  height: min(86vh, 720px);
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+.history-body {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.history-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  flex: 0 0 auto;
+}
+.history-toolbar #historySearch { flex: 1 1 160px; }
+.history-list {
+  flex: 1 1 auto;
+  min-height: 285px;
+  max-height: 285px;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding-right: 4px;
+}
+.history-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 8px 10px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--panel);
+  cursor: pointer;
+  transition: border-color .12s ease, background-color .12s ease;
+}
+.history-row:hover { border-color: var(--accent); background: #fbfbf9; }
+.history-row.disabled { opacity: .55; cursor: not-allowed; }
+.history-row .hist-img {
+  width: 92px;
+  height: 56px;
+  object-fit: cover;
+  border-radius: 6px;
+  background: #d3d4d8; /* 封面加载中的占位底色（比原浅灰略深） */
+  flex: none;
+}
+.history-row .hist-info { flex: 1; min-width: 0; }
+.history-row .hist-t { font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.history-row .hist-meta { color: var(--muted); font-size: 12px; margin-top: 2px; }
+.history-row .hist-time { color: var(--muted); font-size: 12px; }
+.history-row .hist-size { color: var(--muted); font-size: 12px; }
+.history-row .hist-check { flex: none; margin: 0; }
+.empty-history { color: var(--muted); text-align: center; padding: 36px 0; }
+.history-modal input[type="search"],
+.history-modal select {
+  min-height: 36px;
+  color: var(--text);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--input-bg);
+  padding: 6px 9px;
+  font: inherit;
+}
+.history-modal input[type="search"]:focus,
+.history-modal select:focus {
+  outline: 2px solid rgba(23, 107, 91, 0.25);
+  border-color: var(--accent);
+}
+.history-modal input[type="search"]::-webkit-search-cancel-button { -webkit-appearance: none; }
+.history-actions select,
+.history-toolbar select {
+  -webkit-appearance: none;
+  appearance: none;
+  padding-right: 24px;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='11' height='11' viewBox='0 0 24 24'%3E%3Cpath fill='%23176b5b' d='M7 10l5 5 5-5z'/%3E%3C/svg%3E");
+  background-repeat: no-repeat;
+  background-position: right 9px center;
+  cursor: pointer;
+}
+.history-modal input[type="checkbox"] {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 16px;
+  height: 16px;
+  margin: 0;
+  border: 1px solid var(--line);
+  background: var(--input-bg);
+  border-radius: 4px;
+  position: relative;
+  cursor: pointer;
+  flex: none;
+}
+.history-modal input[type="checkbox"]:checked {
+  background: var(--accent);
+  border-color: var(--accent);
+}
+.history-modal input[type="checkbox"]:checked::after {
+  content: "";
+  position: absolute;
+  left: 4.5px;
+  top: 2px;
+  width: 4px;
+  height: 8px;
+  border: solid #fff;
+  border-width: 0 2px 2px 0;
+  transform: rotate(45deg);
+}
+.history-modal input[type="checkbox"]:hover:not(:checked) { border-color: var(--accent); }
+.history-toolbar button.danger-button {
+  -webkit-appearance: none;
+  appearance: none;
+  border: 1px solid currentColor;
+  background: var(--danger);
+  color: #fff;
+  border-radius: 6px;
+  padding: 6px 11px;
+  cursor: pointer;
+  font: inherit;
+  min-height: 40px;
+}
+.history-toolbar button.danger-button:hover { background: var(--danger-strong); }
+
+.history-modal #historySearch { width: 100%; }
+.history-actions {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 8px;
+  flex: 0 0 auto;
+}
+.history-action-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 36px;
+  width: 100%;
+  box-sizing: border-box;
+}
+
+.history-control-row {
+  display: grid;
+  grid-template-columns: 3fr 2fr;
+  gap: 8px;
+  align-items: center;
+  flex: 0 0 auto;
+}
+.grid-2-5
+{
+  grid-template-columns: 2fr 5fr;
+}
+.history-control-row #historySearch,
+.history-control-row select {
+  width: 100%;
+}
+.history-modal .danger-button,
+.history-control-row .danger-button {
+  -webkit-appearance: none;
+  appearance: none;
+  border: 1px solid var(--danger);
+  background: var(--danger);
+  color: #fff;
+  border-radius: 6px;
+  padding: 6px 11px;
+  cursor: pointer;
+  font: inherit;
+  min-height: 40px;
+}
+.history-modal .danger-button:hover,
+.history-control-row .danger-button:hover {
+  background: var(--danger-strong);
+}
+
+/* 历史弹窗回到顶部按钮（页面同款，但定位到列表容器内右下） */
+.history-body { position: relative; }
+.history-back-top {
+  position: absolute;
+  right: 14px;
+  bottom: 10px;
+  width: 40px;
+  height: 40px;
+  border-radius: 50%;
+  border: 1px solid var(--line);
+  background: var(--accent);
+  color: var(--panel);
+  font-size: 20px;
+  line-height: 1;
+  cursor: pointer;
+  box-shadow: var(--shadow);
+  opacity: 0;
+  visibility: hidden;
+  transform: translateY(6px);
+  transition: opacity .15s ease, transform .15s ease, background-color .15s ease;
+  z-index: 8;
+}
+.history-back-top.is-visible { opacity: 1; visibility: visible; transform: translateY(0); }
+.history-back-top:hover { background: var(--accent-strong); color: #fff; }
+.history-list { scrollbar-gutter: stable; }
