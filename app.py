@@ -70,6 +70,35 @@ def local_cache_dir(file_hash: str) -> Path:
     return CACHE_DIR / "local" / file_hash
 
 
+def image_cache_dir(file_hash: str) -> Path:
+    """单张图片的哈希缓存目录（存原图 crop 与 state.json）。"""
+    return CACHE_DIR / "img" / file_hash
+
+
+def _cache_clearable(cache_dir: Path) -> bool:
+    """仅允许清除已知的缓存子目录，避免越界删除。"""
+    try:
+        cache_dir = cache_dir.resolve()
+        root = CACHE_DIR.resolve()
+        rel = cache_dir.relative_to(root)
+    except (OSError, ValueError):
+        return False
+    return rel.parts and rel.parts[0] in {"bv", "local", "img"}
+
+
+def has_restorable_cache(cache_dir: Path, state: Optional[Dict[str, Any]] = None) -> bool:
+    """有可恢复的截图/裁剪才算命中：state 含 captures 且对应 png 存在。"""
+    if state is None:
+        state = load_state_json(cache_dir)
+    if not state or not state.get("captures"):
+        return False
+    crops = cache_dir / "crops"
+    files = (state.get("captures") or [])
+    if not files:
+        return False
+    return any((crops / (f.get("file") or "")).exists() for f in files)
+
+
 def load_state_json(cache_dir: Path) -> Optional[Dict[str, Any]]:
     p = cache_dir / "state.json"
     if not p.exists():
@@ -688,6 +717,9 @@ def import_source():
                 job_id = make_cached_job(source_id, cache_dir, state)
                 source["restore"] = {"job_id": job_id, "images": restore_images(state), "layout": state.get("layout"), "maxStage": state.get("maxStage")}
                 source["download"]["status"] = "done"
+                # 命中可恢复缓存：交由前端弹窗让用户选“恢复进度/清除缓存”。
+                source["has_cache"] = True
+                source["cache"] = {"cache_dir": str(cache_dir), "type": "bilibili", "key": bvid_id or f"av{aid}", "title": metadata.display_title or metadata.raw_title}
                 if cached_video is not None:
                     source["video_path"] = str(cached_video)
             elif cached_video is not None:
@@ -710,13 +742,61 @@ def import_source():
             upload.save(saved_path)
             if suffix in ALLOWED_IMAGE_EXTENSIONS:
                 metadata = build_video_metadata(raw_title=Path(original_name).stem)
+                file_hash = hash_file(saved_path)
+                cache_dir = image_cache_dir(file_hash)
+                cache_dir.mkdir(parents=True, exist_ok=True)
+                crops = cache_dir / "crops"
+                crops.mkdir(parents=True, exist_ok=True)
+
+                # 缓存主图（供二次命中时原样恢复）。
+                master = cache_dir / f"master{suffix}"
+                if not master.exists():
+                    with open(master, "wb") as mf:
+                        mf.write(saved_path.read_bytes())
+
+                # 首导即把整图作为一张 baseline crop 持久化（单图即态）。
+                out_name = "import.png"
+                baseline = crops / out_name
+                prior = load_state_json(cache_dir)
+                hit = has_restorable_cache(cache_dir, prior)
+                if not baseline.exists():
+                    _im = Image.open(str(master)).convert("RGB")
+                    _im.save(baseline)
+                    _w, _h = _im.size
+                    _caps = [{"file": out_name, "url": "x", "t": 0.0, "w": _w, "h": _h}]
+                    save_state_json(
+                        cache_dir,
+                        {
+                            "captures": _caps,
+                            "images": restore_images({"captures": _caps}),
+                            "capture_params": {},
+                            "metadata": metadata_to_dict(metadata),
+                        },
+                    )
+
                 source = {
                     "id": source_id,
                     "type": "image",
-                    "path": str(saved_path),
+                    "path": str(master),
                     "metadata": metadata_to_dict(metadata),
                     "duration": None,
+                    "cache_dir": str(cache_dir),
+                    "download": {"status": "done", "message": None},
                 }
+
+                # 有可恢复截图才真正命中显示（再次导入同一张图时的情形）。
+                if hit:
+                    state = load_state_json(cache_dir)
+                    job_id = make_cached_job(source_id, cache_dir, state)
+                    source["restore"] = {
+                        "job_id": job_id,
+                        "images": restore_images(state),
+                        "layout": state.get("layout"),
+                        "maxStage": state.get("maxStage"),
+                    }
+                    source["has_cache"] = True
+                    source["cache"] = {"cache_dir": str(cache_dir), "type": "image", "key": file_hash,
+                                       "title": metadata.display_title or metadata.raw_title}
             elif suffix in ALLOWED_VIDEO_EXTENSIONS:
                 duration = get_video_duration(saved_path)
                 metadata = build_video_metadata(raw_title=Path(original_name).stem)
@@ -742,6 +822,10 @@ def import_source():
                 if state is not None and state.get("captures"):
                     job_id = make_cached_job(source_id, cache_dir, state)
                     source["restore"] = {"job_id": job_id, "images": restore_images(state), "layout": state.get("layout"), "maxStage": state.get("maxStage")}
+                    # 命中可恢复缓存：交由前端弹窗让用户选“恢复进度/清除缓存”。
+                    source["has_cache"] = True
+                    source["cache"] = {"cache_dir": str(cache_dir), "type": "local", "key": file_hash,
+                                       "title": metadata.display_title or metadata.raw_title}
             else:
                 return json_error("不支持的文件格式，请使用视频（mp4/mov/mkv/webm）或图片（png/jpg/webp/bmp/gif）。")
         else:
@@ -764,6 +848,38 @@ def source_download_status(source_id: str):
     if source is None:
         return json_error("未知的视频源。", 404)
     return jsonify(source.get("download") or {"status": "idle", "message": None})
+
+
+@app.post("/api/cache_clear")
+def cache_clear():
+    """按导入类型清除该源的缓存（截图/裁剪进度）。
+
+    参数：type ∈ {bilibili, local, image}；key = bvid | 哈希。
+    仅允许删除 CACHE/bv、/local、/img 下的已知目录。
+    """
+    payload = request.get_json(force=True, silent=True) or {}
+    kind = payload.get("type")
+    key = (payload.get("key") or "").strip()
+    safe_key = Path(key).name if key else ""
+    if not safe_key or safe_key != key.rsplit("/", 1)[-1].rsplit("\\", 1)[-1]:
+        return json_error("非法 key。", 400)
+
+    if kind == "bilibili":
+        cache_dir = bilibili_cache_dir(safe_key)
+    elif kind in ("local", "image"):
+        cache_dir = image_cache_dir(safe_key) if kind == "image" else local_cache_dir(safe_key)
+    else:
+        return json_error("未知缓存类型。", 400)
+
+    if not _cache_clearable(cache_dir):
+        return json_error("不允许清除该目录。", 403)
+
+    for old in (cache_dir / "crops").glob("*.png"):
+        old.unlink(missing_ok=True)
+    (cache_dir / "state.json").unlink(missing_ok=True)
+    # 注意：不清除 SOURCES/JOBS 里的内存 source——用户“从新开始”后仍要沿用同一个
+    # source 继续处理当前文件，只是不再命中旧缓存。
+    return jsonify({"ok": True})
 
 
 @app.post("/api/save_state")

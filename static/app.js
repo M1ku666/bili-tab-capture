@@ -55,6 +55,11 @@ const els = {
   localFile: document.getElementById("localFile"),
   fileField: document.querySelector(".file-field"),
   fileHint: document.querySelector(".file-hint"),
+  cacheModal: document.getElementById("cacheModal"),
+  cacheModalClose: document.getElementById("cacheModalClose"),
+  cacheModalDesc: document.getElementById("cacheModalDesc"),
+  cacheModalRestore: document.getElementById("cacheModalRestore"),
+  cacheModalClear: document.getElementById("cacheModalClear"),
   previewFrame: document.getElementById("previewFrame"),
   timeline: document.getElementById("timeline"),
   timelineTrack: document.getElementById("timelineTrack"),
@@ -737,7 +742,15 @@ function resetExtractionState() {
   setStatus(els.extractStatus, "");
 }
 
-function applySource(source) {
+let pendingCacheSource = null; // 已命中缓存但等待用户“恢复/清除”决定的源
+
+function applySource(source, mode /* '' | 'restore' | 'fresh' */) {
+  // 命中缓存且尚未做“恢复/清除”决定时，先弹窗询问，等用户选择后再继续。
+  if (!mode && source.has_cache && source.cache) {
+    openCachePrompt(source);
+    return;
+  }
+
   state.previewRequestId += 1;
   state.previewTime = null;
   state.pendingPreviewTime = null;
@@ -785,8 +798,8 @@ function applySource(source) {
   updateCropUi();
   updateTimeline();
 
-  // 命中缓存：直接恢复截图、调整状态与排版参数；若已保存过排版则直接跳到第四步。
-  if (source.restore) {
+  // 用户选择“恢复进度”：恢复截图、调整状态与排版参数；若已保存过排版则直接跳到第四步。
+  if (mode === "restore" && source.restore) {
     state.captureJobId = source.restore.job_id;
     restoreCards(source.restore.images);
     restoreLayout(source.restore.layout);
@@ -808,6 +821,61 @@ function applySource(source) {
   state.maxStage = 2;
   setStage(2);
 }
+
+function openCachePrompt(source) {
+  pendingCacheSource = source;
+  els.cacheModalDesc.textContent = source.cache.title ? source.cache.title : source.cache.key;
+  els.cacheModal.classList.remove("hidden");
+  // 键盘便利：Esc 关闭视作暂不恢复
+  if (!window.__cacheKeyHandler) {
+    window.__cacheKeyHandler = (e) => {
+      if (e.key === "Escape" && !els.cacheModal.classList.contains("hidden")) {
+        els.cacheModal.classList.add("hidden");
+      }
+    };
+    document.addEventListener("keydown", window.__cacheKeyHandler);
+  }
+}
+
+async function resumePendingCache() {
+  const source = pendingCacheSource;
+  pendingCacheSource = null;
+  els.cacheModal.classList.add("hidden");
+  if (!source) return;
+  applySource(source, "restore");
+}
+
+async function clearPendingCache() {
+  const source = pendingCacheSource;
+  pendingCacheSource = null;
+  els.cacheModalDesc.textContent = "正在清除该内容的旧缓存…";
+  els.cacheModalRestore.disabled = true;
+  els.cacheModalClear.disabled = true;
+  try {
+    const cache = source.cache || {};
+    if (source.id) {
+      // 先在服务端删除缓存目录/state
+      await fetchJson("/api/cache_clear", {
+        method: "POST",
+        body: JSON.stringify({ type: cache.type, key: cache.key }),
+      });
+    }
+    const fresh = Object.assign({}, source);
+    // 清除后当作“全新的该源”继续：服务端该 source 仍有效（cache_clear 不删内存），
+    // 去掉 restore/has_cache 即可开始新处理，无需回第一步重选文件。
+    delete fresh.restore;
+    delete fresh.has_cache;
+    els.cacheModal.classList.add("hidden");
+    applySource(fresh, "fresh");
+  } catch (error) {
+    setStatus(els.importStatus, error.message || "清除缓存失败。", "error");
+  } finally {
+    els.cacheModalRestore.disabled = false;
+    els.cacheModalClear.disabled = false;
+    els.cacheModal.classList.add("hidden");
+  }
+}
+
 
 async function loadPreview(timeValue) {
   if (!state.sourceId) return;
@@ -2940,6 +3008,18 @@ els.loginModal.addEventListener("click", (e) => {
   if (e.target === els.loginModal) {
     els.loginModal.classList.add("hidden");
     stopLoginPolling();
+  }
+});
+
+// —— 缓存“恢复/清除”弹窗 ——
+els.cacheModalRestore.addEventListener("click", resumePendingCache);
+els.cacheModalClear.addEventListener("click", clearPendingCache);
+els.cacheModalClose.addEventListener("click", () => {
+  els.cacheModal.classList.add("hidden");
+});
+els.cacheModal.addEventListener("click", (e) => {
+  if (e.target === els.cacheModal) {
+    els.cacheModal.classList.add("hidden");
   }
 });
 
