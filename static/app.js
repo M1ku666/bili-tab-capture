@@ -3320,22 +3320,22 @@ function renderUpdateLog(tags) {
 // 检查更新：GET gitee tags API。
 async function checkForUpdate() {
   try {
-    const res = await fetch("https://gitee.com/api/v5/repos/m1ku666/bili-tab-capture/tags/", { method: "GET" });
-    if (!res.ok) return;
-    const tags = await res.json();
-    if (!Array.isArray(tags) || !tags.length) return;
-    // gitee tags 接口返回的可能是按时间倒序；这里取版本号最大者作为最新。
-    const latest = tags.reduce((a, b) => (compareVersions(b.name, a.name) > 0 ? b : a), tags[0]);
-    state.latestVersion = latest.name;
-    const isNewer = compareVersions(latest.name, APP_VERSION) > 0;
-    if (!isNewer) return; // 已是最新，不显示「下载新版本」
+    console.log("[update] APP_VERSION =", APP_VERSION);
+    const data = await fetchJson("/api/latest_version");
+    const latest = data && data.version;
+    console.log("[update] latest", latest, "releases", (data && data.releases || []).length);
+    if (!latest) return;
+    state.latestVersion = latest;
+    const isNewer = compareVersions(latest, APP_VERSION) > 0;
+    if (!isNewer) return;
     els.updateLink.classList.remove("hidden");
-    // 若已跳过该最新版本，则启动时不自动弹窗。
-    if ((await readSkippedVersion()) === latest.name) return;
-    renderUpdateLog(tags);
+    const skipped = await readSkippedVersion();
+    console.log("[update] skipped", skipped);
+    if (skipped === latest) return;
+    renderUpdateLog((data && data.releases) || []);
     els.updateModal.classList.remove("hidden");
   } catch (e) {
-    // 网络失败静默处理。
+    console.warn("[update] check failed:", e);
   }
 }
 

@@ -16,7 +16,10 @@
         <h1>BiliTabCapture</h1>
         <p class="tagline-row">动态谱 PDF 提取器 <span class="version-badge">v{{ app_version }}</span>
           <button class="info-btn" id="infoButton" type="button" aria-label="关于">i</button>
-          <a class="update-link hidden" id="updateLink" href="https://gitee.com/m1ku666/bili-tab-capture/releases" target="_blank" rel="noopener">下载新版本</a>
+          <span class="update-link hidden" id="updateLink">
+            <a href="https://gitee.com/m1ku666/bili-tab-capture/releases" target="_blank" rel="noopener">从Gitee下载新版本</a>
+            <a href="https://github.com/m1ku666/bili-tab-capture/releases" target="_blank" rel="noopener">从GitHub下载新版本</a>
+          </span>
         </p>
       </div>
       <nav class="stepper" aria-label="流程步骤">
@@ -481,7 +484,11 @@
       </div>
       <div class="modal-body about-body">
         <p class="about-row"><span class="about-label">介绍视频</span><a href="https://www.bilibili.com/video/BV1KXgP6SEZ4" target="_blank" rel="noopener">BV1KXgP6SEZ4</a></p>
-        <p class="about-row"><span class="about-label">版本记录</span><a href="https://gitee.com/m1ku666/bili-tab-capture/releases" target="_blank" rel="noopener">Releases</a></p>
+        <p class="about-row"><span class="about-label">版本记录</span><span>
+          <a href="https://gitee.com/m1ku666/bili-tab-capture/releases" target="_blank" rel="noopener">Gitee</a>
+          或
+          <a href="https://github.com/m1ku666/bili-tab-capture/releases" target="_blank" rel="noopener">GitHub</a>
+        </span></p>
         <p class="about-row"><span class="about-label">漏洞反馈</span><span><a href="https://space.bilibili.com/315868199" target="_blank" rel="noopener">B站私信</a>  或  <a id="copyEmailLink" href="mailto:m1ku666@foxmail.com">复制邮箱</a></span></p>
       </div>
     </div>
@@ -495,8 +502,11 @@
       </div>
       <div class="modal-body">
         <div class="update-log" id="updateLog"></div>
-        <div class="modal-actions modal-actions-row">
-          <a class="primary-button" id="updateDownloadBtn" href="https://gitee.com/m1ku666/bili-tab-capture/releases" target="_blank" rel="noopener">下载新版本</a>
+        <div class="upd-download-row">
+          <a class="primary-button" id="updateDownloadBtn" href="https://gitee.com/m1ku666/bili-tab-capture/releases" target="_blank" rel="noopener">从Gitee下载</a>
+          <a class="primary-button" href="https://github.com/m1ku666/bili-tab-capture/releases" target="_blank" rel="noopener">从GitHub下载</a>
+        </div>
+        <div class="upd-skip-row">
           <button class="secondary-button" id="updateSkipBtn" type="button">跳过此版本</button>
         </div>
       </div>

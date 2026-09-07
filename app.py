@@ -2141,6 +2141,70 @@ def job_long_image(job_id: str):
     return send_from_directory(RUNS_DIR / job_id, path.name, as_attachment=False)
 
 
+def _ver_key(v):
+    import re as _re
+    m = _re.findall(r"\d+", str(v or ""))
+    return [int(x) for x in m][:4]
+
+
+@app.get("/api/latest_version")
+def api_latest_version():
+    """服务端获取最新 release 版本(首选 Gitee，拉不到再试 GitHub)，避免浏览器403/CORS。"""
+    import urllib.request as _ul, re as _re
+
+    UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/124.0 Safari/537.36"
+
+    def _pull(url, kind):
+        req = _ul.Request(url, headers={"User-Agent": UA, "Accept": "application/json"})
+        out = []
+        with _ul.urlopen(req, timeout=8) as resp:
+            data = json.loads(resp.read().decode("utf-8", "replace"))
+        if not isinstance(data, list):
+            return None
+        for item in data:
+            if not isinstance(item, dict):
+                continue
+            tag = item.get("tag_name") or item.get("name") or ""
+            if not tag:
+                continue
+            if kind == "github":
+                msg = item.get("body") or ""
+            else:
+                msg = (item.get("message") or "") if (item.get("message") not in (None, "")) \
+                    else (item.get("tag_name") or "")
+            out.append((_ver_key(tag), tag, msg or ""))
+        return out or None
+
+    def _answer(kind, hits):
+        uniq = {}
+        for _k, tag, msg in hits:
+            if tag not in uniq or msg:
+                uniq[tag] = msg
+        releases = sorted(
+            [{"name": tag, "message": msg} for tag, msg in uniq.items()],
+            key=lambda r: _ver_key(r["name"]),
+            reverse=True,
+        )
+        top = max(hits, key=lambda h: h[0])
+        return jsonify({"version": top[1], "source": kind if top[1] else None, "releases": releases})
+
+    # 1) Gitee tags API
+    try:
+        api = _pull("https://gitee.com/api/v5/repos/m1ku666/bili-tab-capture/tags?", "gitee")
+        if api:
+            return _answer("gitee", api)
+    except Exception:
+        api = None
+    # 2) GitHub releases 兜底
+    try:
+        gh = _pull("https://api.github.com/repos/m1ku666/bili-tab-capture/releases?per_page=30", "github")
+        if gh:
+            return _answer("github", gh)
+    except Exception:
+        pass
+    return jsonify({"version": None, "source": None, "releases": []})
+
+
 @app.get("/api/previews/<path:filename>")
 def preview_file(filename: str):
     return send_from_directory(PREVIEWS_DIR, filename, as_attachment=False)

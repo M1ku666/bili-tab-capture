@@ -2453,3 +2453,35 @@ button:disabled {
 .history-back-top.is-visible { opacity: 1; visibility: visible; transform: translateY(0); }
 .history-back-top:hover { background: var(--accent-strong); color: #fff; }
 .history-list { scrollbar-gutter: stable; }
+
+/* 更新链接拆成 Gitee/GitHub 两平台 */
+#updateLink a {
+  color: var(--accent);
+  margin-right: 10px;
+  white-space: nowrap;
+}
+#updateLink a:hover { text-decoration: underline; }
+
+/* 更新弹窗：Gitee/GitHub 两下载与跳过放同一行不折行 */
+#updateModal .modal-actions-row { flex-wrap: nowrap; }
+#updateModal .modal-actions-row a.primary-button,
+#updateModal .modal-actions-row button { white-space: nowrap; }
+
+/* 更新弹窗按钮两行：Gitee/GitHub 一行各占一半，跳过另起独占 */
+.upd-download-row {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 10px;
+  margin-top: 14px;
+}
+.upd-download-row a.primary-button {
+  display: inline-flex;
+  justify-content: center;
+  align-items: center;
+  white-space: nowrap;
+}
+.upd-skip-row {
+  display: grid;
+  grid-template-columns: 1fr;
+}
+.upd-skip-row button { width: 100%; }
