@@ -362,6 +362,12 @@ def run_capture_job(job_id: str, payload: Dict[str, Any]) -> None:
                 comparison_dir = run_dir / "comparison" if options.debug_diffs else None
                 run_dir.mkdir(parents=True, exist_ok=True)
 
+            # 每次重新生成截图前清空上一次运行遗留的旧截图，避免调整起止时间再次
+            # “生成图片”时把上一批已不生效的图片一起收集进来造成残留。
+            for old in crops_dir.glob("*.png"):
+                old.unlink(missing_ok=True)
+            (crops_dir / "times.json").unlink(missing_ok=True)
+
             update_job(job_id, status="running", phase="downloading", updated_at=time.time())
 
             source_metadata = metadata_from_dict(source["metadata"])
