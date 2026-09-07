@@ -473,8 +473,8 @@ def binarize_luminance(
 def extract_note_mask(
     image: Image.Image,
     note_rgb: Tuple[int, int, int],
-    tolerance: float = 60.0,
-    softness: float = 20.0,
+    tolerance: float = 300.0,
+    softness: float = 90.0,
 ) -> Image.Image:
     """按音符颜色把图像转成「音符黑、其它白」的灰度图（平滑过渡）。
 
@@ -511,8 +511,8 @@ def recolor_gray(
 def preprocess_for_detection(
     image: Image.Image,
     note_rgb: Optional[Tuple[int, int, int]] = None,
-    tolerance: float = 60.0,
-    softness: float = 20.0,
+    tolerance: float = 300.0,
+    softness: float = 90.0,
 ) -> Image.Image:
     """自动检测前的预处理。
 
@@ -1676,8 +1676,8 @@ def compute_stitch_seams(
     coefficient_horizontal: float = 0.7,
     coefficient_vertical: float = 0.8,
     note_rgb: Optional[Tuple[int, int, int]] = None,
-    tolerance: float = 60.0,
-    softness: float = 20.0,
+    tolerance: float = 300.0,
+    softness: float = 90.0,
 ) -> List[Tuple[float, float]]:
     """返回相邻截图之间的拼接缝，长度 len(images)-1。
 

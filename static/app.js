@@ -1207,6 +1207,7 @@ async function loadIcons() {
     "droplet-off": "droplet-off",
     sliders: "sliders",
     upload: "upload",
+    reset: "reset",
   };
   await Promise.all(
     Object.entries(files).map(async ([key, file]) => {
@@ -1286,6 +1287,7 @@ function restoreLayout(layout) {
   if (layout.invert != null) els.invertInput.checked = !!layout.invert;
   if (els.recolorInput && layout.recolor != null) els.recolorInput.checked = !!layout.recolor;
   syncRecolorOption();
+  if (typeof refreshResettableIcons === "function") refreshResettableIcons();
 }
 
 function renderCardList() {
@@ -1433,8 +1435,8 @@ function detectParams() {
   // 第三步已去色时，按音符颜色二值化后再检测。
   if (state.noteColorSelected) {
     p.note_color = els.noteColor.value || "#000000";
-    p.tolerance = numericValue(els.tolerance, 60);
-    p.softness = numericValue(els.softness, 20);
+    p.tolerance = numericValue(els.tolerance, 300);
+    p.softness = numericValue(els.softness, 90);
   }
   return p;
 }
@@ -2683,8 +2685,8 @@ function layoutPayload() {
     binarize: !!(state.noteColorSelected && els.recolorInput && els.recolorInput.checked),
     invert: els.invertInput.checked,
     note_color: els.noteColor.value || "#000000",
-    tolerance: numericValue(els.tolerance, 60),
-    softness: numericValue(els.softness, 20),
+    tolerance: numericValue(els.tolerance, 300),
+    softness: numericValue(els.softness, 90),
     title: els.titleArea.value,
     output: firstTitleLine() || "tablatura.pdf",
   };
@@ -3483,3 +3485,174 @@ window.addEventListener("beforeunload", () => {
   if (persistTimer) clearTimeout(persistTimer);
   persistStateNow();
 });
+
+/* ===================== 可还原输入（恢复默认） ===================== */
+// 显式默认表：owner 是会显示还原图标并监听的主输入；partners 是需一并同步的控件。
+// 只覆盖设置/布局面板内可调控件，排除 file/radio/checkbox/动态插入小输入。
+let __res = [];
+
+function _resName(o) {
+  return (o && o.name) || "";
+}
+
+function _currVal(o) {
+  if (!o) return null;
+  return o.value;
+}
+
+function _numEqual(a, b) {
+  if (a === "" || b === "") return a === b;
+  const an = Number(a), bn = Number(b);
+  return Number.isFinite(an) && Number.isFinite(bn) ? an === bn : String(a).trim().toLowerCase() === String(b).trim().toLowerCase();
+}
+
+function _isDefault(group) {
+  const owner = els[group.owner];
+  if (!owner) return true;
+  let def = group.default;
+  if (typeof def === "function") def = def();
+  const cur = owner.value;
+  if (group.kind === "number" || group.kind === "range" || group.kind === "slider") {
+    // range/number/color 都按值比较
+    if (group.kind === "color") return String(cur).trim().toLowerCase() === String(def).toLowerCase();
+    return _numEqual(String(cur), String(def));
+  }
+  if (group.kind === "area") return (cur || "").trim() === String(def).trim();
+  return String(cur || "") === String(def);
+}
+
+function _refresh(group) {
+  const owner = els[group.owner];
+  const icon = group._icon;
+  if (!owner || !icon) return;
+  const vis = !_isDefault(group);
+  icon.classList.toggle("visible", vis);
+}
+
+function _resetGroup(group) {
+  const t = group.els; // owner + partners
+  let val = group.default;
+  if (typeof val === "function") val = val();
+  if (!Array.isArray(t)) return;
+  t.forEach((idEl) => {
+    if (!idEl) return;
+    idEl.value = String(val);
+  });
+  // 触发该输入自己的渲染回调（input 事件大多自带：这里触发绑定到的 color/slider 同步）
+  t.forEach((idEl) => {
+    if (!idEl) return;
+    idEl.dispatchEvent(new Event("input", { bubbles: true }));
+  });
+  // 若绑定的是 range/number/clor 派发可能足够，额外触发 change 兜底
+  t.forEach((idEl) => {
+    if (!idEl) return;
+    idEl.dispatchEvent(new Event("change", { bubbles: true }));
+  });
+  // 再刷新图标（输入被还原成默认应隐藏）
+  _refresh(group);
+  setTimeout(() => _refresh(group), 0);
+}
+
+function initResettableControls() {
+  if (typeof els === "undefined") return;
+
+  // 清理可能重复：重入时避免双图标
+  document.querySelectorAll(".res-field .resetafter").forEach((e) => {
+    // 重新初始化时只移除我们自己加的
+    e.remove();
+  });
+  document.querySelectorAll(".res-field").forEach((e) => {
+    // 若无人再需要可复位，移除 res-field 不影响
+  });
+
+  // 图标改用独立 SVG 文件 /static/icons/reset.svg（随 loadIcons 载入 ICONS.reset）。
+  // 为空占位文件时显示为空描边框占位，替换该文件即全局换新图形。
+  const svg = () =>
+    (typeof ICONS !== "undefined" && ICONS.reset) ||
+    '<svg viewBox="0 0 24 24" aria-hidden="true" focusable="false">' +
+      '<rect x="2" y="2" width="20" height="20" rx="6" fill="none" stroke="currentColor"/></svg>';
+
+  const groups = [
+    { kind: "number", owner: "sampleEvery", els: ["sampleEvery"], default: 2 },
+    { kind: "number", owner: "diffThreshold", els: ["diffThreshold"], default: 0.010 },
+    { kind: "number", owner: "bandHalfWidth", els: ["bandHalfWidth"], default: 90 },
+    { kind: "number", owner: "compareWindow", els: ["compareWindow"], default: 1 },
+    { kind: "slider", owner: "toleranceNum", els: ["toleranceNum", "tolerance"], default: 300 },
+    { kind: "slider", owner: "softnessNum", els: ["softnessNum", "softness"], default: 90 },
+    { kind: "number", owner: "coeffHorizontal", els: ["coeffHorizontal"], default: 0.7 },
+    { kind: "number", owner: "stitchMaxWidth", els: ["stitchMaxWidth"], default: 600 },
+    { kind: "number", owner: "coeffVertical", els: ["coeffVertical"], default: 0.8 },
+    { kind: "slider", owner: "scaleInput", els: ["scaleInput", "scaleSlider"], default: 1 },
+    { kind: "slider", owner: "pageMargin", els: ["pageMargin", "marginSlider"], default: 40 },
+    { kind: "slider", owner: "imageSpacing", els: ["imageSpacing", "spacingSlider"], default: 25 },
+    { kind: "slider", owner: "titleSpacing", els: ["titleSpacing", "titleSpacingSlider"], default: 130 },
+    { kind: "color", owner: "bgColorHex", els: ["bgColorHex", "bgColor"], default: "#ffffff" },
+    { kind: "color", owner: "textColorHex", els: ["textColorHex", "textColor"], default: "#000000" },
+  ];
+
+  __res = groups.map((g) => {
+    const owner = els[g.owner];
+    if (!owner) return null;
+    const idx = g.els.map((eid) => els[eid]).filter(Boolean);
+    const grp = Object.assign({}, g, { els: idx });
+
+    // 定位可包含的 .field / .slider-field /.color-inputs / .field-wide / .binarize-slider-row
+    let anchor = owner.closest(".field, .slider-field, .color-inputs, .field-wide, .binarize-slider-row, .clean-field");
+    // 若 owner 不在 field（如文本框直接在某格子），回退 owner.parentElement
+    if (!anchor) anchor = owner.closest("label") || owner.parentElement;
+    if (!anchor) return null;
+    anchor.classList.add("res-field");
+
+    const btn = document.createElement("button");
+    btn.type = "button";
+    btn.className = "resetafter";
+    btn.title = "恢复默认值";
+    btn.setAttribute("aria-label", "恢复默认值");
+    btn.innerHTML = svg();
+    btn.addEventListener("click", (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      _resetGroup(grp);
+    });
+    anchor.appendChild(btn);
+
+    (function sync() {
+      // 组主输入变化触发可见更新
+      const cb = () => _refresh(grp);
+      idx.forEach((el) => el.addEventListener("input", cb));
+      idx.forEach((el) => el.addEventListener("change", cb));
+    })();
+
+    grp._icon = btn;
+    _refresh(grp);
+    return grp;
+  }).filter(Boolean);
+}
+
+function refreshResettableIcons() {
+  (__res || []).forEach(_refresh);
+}
+
+// 在应用/恢复布局、面板切换后刷新图标显隐。
+if (typeof els !== "undefined") {
+  // applySource/restoreLayout/… 由调用方自行在末尾调用 refreshResettableIcons 即可；
+  // 这里用兜底的监听让每次 UI 变化后刷新。
+  document.addEventListener("click", () => setTimeout(refreshResettableIcons, 0), { capture: true });
+  document.addEventListener("input", () => setTimeout(refreshResettableIcons, 0), { capture: true });
+  initResettableControls();
+
+  // loadIcons 是异步的：等 /static/icons/reset.svg 载入好后，再把真实图形应用到各按钮
+  // （文件为空时仍是空占位；替换文件后需刷新页面即可看到新图标）。
+  function applyResetIconLater() {
+    if (typeof ICONS !== "undefined" && ICONS.reset) {
+      document.querySelectorAll(".resetafter").forEach((b) => {
+        if (b && ICONS.reset) b.innerHTML = ICONS.reset;
+      });
+      // 图标图形替换不影响按钮占位区尺寸
+      refreshResettableIcons();
+    } else {
+      setTimeout(applyResetIconLater, 150);
+    }
+  }
+  applyResetIconLater();
+}

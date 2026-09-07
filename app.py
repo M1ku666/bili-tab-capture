@@ -197,6 +197,86 @@ def ensure_cache_dirs() -> None:
         directory.mkdir(parents=True, exist_ok=True)
 
 
+def cleanup_orphan_transient() -> int:
+    """删除“孤儿”中间产物：目录因没有对应的内存 source/job 而不被任何生命周期引用。
+
+    runs/uploads/previews 只作为本机操作中的中间步骤(生成中的 final 分片、待导出的
+    PDF/长图、预览缩略图、上传中转)，不参与持久缓存恢复(那是 bv/local/img)。
+    干净的判据是状态而非时间：一旦其所属的 job/source 已结束(不在内存 SOURCES/JOBS)，
+    该产物即为孤儿，可安全删除。返回清理的目录数。
+    """
+    with STORE_LOCK:
+        live_source_ids = {str(s.get("id")) for s in SOURCES.values()}
+        live_job_ids = set(JOBS.keys())
+    removed = 0
+
+    # uploads/<source_id>: 仅当该 source 已不存在且目录非空时清理。
+    for d in UPLOADS_DIR.glob("*/"):
+        if d.is_dir() and d.name not in live_source_ids:
+            shutil.rmtree(d, ignore_errors=True)
+            removed += 1
+
+    # previews: 顶层 <sourceid>_<ms>_<rand>.jpg 及 <sourceid>/(video) 均为该 source 的临时帧。
+    for f in PREVIEWS_DIR.glob("*.jpg"):
+        sid = (f.name or "").split("_", 1)[0]
+        if sid not in live_source_ids:
+            f.unlink(missing_ok=True)
+            removed += 1
+    for d in PREVIEWS_DIR.glob("*/"):
+        if d.is_dir() and d.name not in live_source_ids:
+            shutil.rmtree(d, ignore_errors=True)
+            removed += 1
+
+    # runs/<job_id>: 当前无内存 job 引用即是孤儿。
+    for d in RUNS_DIR.glob("*/"):
+        if d.is_dir() and d.name not in live_job_ids:
+            shutil.rmtree(d, ignore_errors=True)
+            removed += 1
+    return removed
+
+
+def cleanup_source_transient(source_id: str) -> None:
+    """某源开始新一轮处理时的流程残档清理（基于生命周期状态）。
+
+    预览缩略图由 /api/preview 每次按需重建，无需长期保留；在同一 source 下删掉即可。
+    持久缓存(bv/local/img)不在此清理范围。
+    """
+    for f in PREVIEWS_DIR.glob(f"{source_id}_*.jpg"):
+        f.unlink(missing_ok=True)
+    vdir = PREVIEWS_DIR / source_id
+    if vdir.exists():
+        shutil.rmtree(vdir, ignore_errors=True)
+
+
+def evict_superseded_jobs(source_id: str, keep_job_id: Optional[str] = None, run_dir_name: Optional[str] = None) -> None:
+    """同源重新处理时代替式清理。
+
+    当一个 job(为该 source)再次发起,旧的同源已完成 job 即被取代：移除其 runs 目录、
+    从内存 JOBS 摘除，让 runs/ 不会同一 source 多次累积。
+    keep_job_id: 若给，则跳过新保留的 job。
+    run_dir_name：job 对应的 runs/<name>(缺省由 JOBS[crops?]推断)。
+    """
+    with STORE_LOCK:
+        stale = []
+        for jid, job in JOBS.items():
+            if run_dir_name and jid == run_dir_name:
+                continue
+            if keep_job_id and jid == keep_job_id:
+                continue
+            if job.get("source_id") != source_id:
+                continue
+            if job.get("status") in ("queued", "running", "downloading"):
+                continue  # 仍在进行中的不可删
+            stale.append(jid)
+        for jid in stale:
+            JOBS.pop(jid, None)
+        stale_dirs = list(stale)
+    # 等在释放 STORE_LOCK 后再删盘
+    for jid in stale_dirs:
+        d = RUNS_DIR / jid
+        if d.exists():
+            shutil.rmtree(d, ignore_errors=True)
+
 def metadata_to_dict(metadata: VideoMetadata) -> Dict[str, Optional[str]]:
     return {
         "raw_title": metadata.raw_title,
@@ -543,6 +623,9 @@ def start_image_capture(source: Dict[str, Any], payload: Dict[str, Any]):
     validate_crop_x_ratios(crop_x_start, crop_x_end)
 
     job_id = uuid.uuid4().hex
+    # 重新生成即取代旧的同源已完成 job；并发中在进行的保留。
+    evict_superseded_jobs(source["id"], run_dir_name=job_id)
+    cleanup_source_transient(source["id"])
     run_dir = RUNS_DIR / job_id
     crops_dir = run_dir / "crops"
     crops_dir.mkdir(parents=True, exist_ok=True)
@@ -740,6 +823,7 @@ def import_source():
             upload_dir.mkdir(parents=True, exist_ok=True)
             saved_path = upload_dir / original_name
             upload.save(saved_path)
+
             if suffix in ALLOWED_IMAGE_EXTENSIONS:
                 metadata = build_video_metadata(raw_title=Path(original_name).stem)
                 file_hash = hash_file(saved_path)
@@ -830,6 +914,12 @@ def import_source():
                 return json_error("不支持的文件格式，请使用视频（mp4/mov/mkv/webm）或图片（png/jpg/webp/bmp/gif）。")
         else:
             return json_error("请填写 BV 号，或选择本地视频。")
+
+        # 文件导入后内容均已进入持久缓存(bv/local/img)：清理 uploads 里的上传中转。
+        # 图片已复制到 img/<hash>/master、视频已 move 到 local/<hash>/；
+        # 该 uploads/<source_id> 只是过渡，可一并删除，避免目录越攒越多。
+        if "upload_dir" in locals() and upload_dir is not None and upload_dir.exists():
+            shutil.rmtree(upload_dir, ignore_errors=True)
 
         with STORE_LOCK:
             SOURCES[source_id] = source
@@ -1024,6 +1114,9 @@ def start_captures():
         )
 
         job_id = uuid.uuid4().hex
+        # 重新生成为同一 source，取代旧同源已完成 job（进行中的保留），清掉旧 preview。
+        evict_superseded_jobs(source["id"], keep_job_id=job_id)
+        cleanup_source_transient(source["id"])
         with STORE_LOCK:
             JOBS[job_id] = {
                 "id": job_id,
@@ -1071,8 +1164,8 @@ def capture_preview(job_id: str, filename: str):
     binarize = parse_bool(request.args.get("binarize"))
 
     note_rgb = parse_optional_note_color(request.args.get("note_color"))
-    tolerance = parse_float(request.args.get("tolerance"), "tolerance", 60.0)
-    softness = parse_float(request.args.get("softness"), "softness", 20.0)
+    tolerance = parse_float(request.args.get("tolerance"), "tolerance", 300.0)
+    softness = parse_float(request.args.get("softness"), "softness", 90.0)
 
     try:
         img = Image.open(src).convert("RGB")
@@ -1101,8 +1194,8 @@ def _parse_layout_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
     binarize = parse_bool(payload.get("binarize"))
     invert = parse_bool(payload.get("invert"))
     note_rgb = parse_optional_note_color(payload.get("note_color"))
-    tolerance = parse_float(payload.get("tolerance"), "tolerance", 60.0)
-    softness = parse_float(payload.get("softness"), "softness", 20.0)
+    tolerance = parse_float(payload.get("tolerance"), "tolerance", 300.0)
+    softness = parse_float(payload.get("softness"), "softness", 90.0)
     orientation = payload.get("orientation") or "portrait"
     if orientation not in ("portrait", "landscape"):
         orientation = "portrait"
@@ -1292,8 +1385,8 @@ def detect_measures():
             payload.get("coefficient_vertical"), "coefficient_vertical", 0.8
         )
         note_rgb = parse_optional_note_color(payload.get("note_color"))
-        tolerance = parse_float(payload.get("tolerance"), "tolerance", 60.0)
-        softness = parse_float(payload.get("softness"), "softness", 20.0)
+        tolerance = parse_float(payload.get("tolerance"), "tolerance", 300.0)
+        softness = parse_float(payload.get("softness"), "softness", 90.0)
         results: Dict[str, List[float]] = {}
         for name in files:
             src = crops_dir / name
@@ -1333,8 +1426,8 @@ def stitch_offsets():
         )
         max_width = int(parse_float(payload.get("max_width"), "max_width", 600))
         note_rgb = parse_optional_note_color(payload.get("note_color"))
-        tolerance = parse_float(payload.get("tolerance"), "tolerance", 60.0)
-        softness = parse_float(payload.get("softness"), "softness", 20.0)
+        tolerance = parse_float(payload.get("tolerance"), "tolerance", 300.0)
+        softness = parse_float(payload.get("softness"), "softness", 90.0)
         images: List[Image.Image] = []
         for name in files:
             src = crops_dir / name
@@ -1647,6 +1740,13 @@ def preview_file(filename: str):
 
 if __name__ == "__main__":
     ensure_cache_dirs()
+    # 删除“孤儿”中间产物：某 job/source 生命周期已结束即不再需要(bv/local/img 持久缓存不受影响)
+    try:
+        n = cleanup_orphan_transient()
+        if n:
+            print(f"已清理 {n} 个已结束 job/source 的中间产物目录。")
+    except Exception:
+        pass
 
     def _port_free(p: int) -> bool:
         import socket as _socket
