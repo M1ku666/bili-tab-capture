@@ -1493,12 +1493,24 @@ def preview_source():
                 video_path = download_bilibili_video(source["url"], base_dir)
                 source["video_path"] = str(video_path)
             save_video_frame(video_path, preview_path, time_sec=time_sec)
-            dl = base_dir / ".dlqn.txt"
-            if dl.exists():
+            # 诚实清晰度：优先 .dlqh(实测像素高度)；否则退 .dlqn(请求档位)
+            dlh = base_dir / ".dlqh.txt"
+            if dlh.exists():
                 try:
-                    resp_quality = dl.read_text(encoding="utf-8").strip()
+                    hv = dlh.read_text(encoding="utf-8").strip()
+                    if hv:
+                        resp_quality = "px:" + hv
                 except OSError:
                     pass
+            if not resp_quality:
+                dl = base_dir / ".dlqn.txt"
+                if dl.exists():
+                    try:
+                        qv = dl.read_text(encoding="utf-8").strip()
+                        if qv:
+                            resp_quality = "q:" + qv
+                    except OSError:
+                        pass
         else:
             save_video_frame(Path(source["path"]), preview_path, time_sec=time_sec)
 

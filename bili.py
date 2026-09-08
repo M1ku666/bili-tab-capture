@@ -221,8 +221,17 @@ def download_bilibili_video_native(
         cid = _get_cid(url, None)
     qmap = {6:6,16:16,32:32,64:64,74:74,80:80,112:112,116:116,120:120}
 
-    def _record(qn):
+    def _record(path, qn):
+        # 角标清晰度以“文件实测高”为准（更不容易标题骗过）。取不到再用 qn。
         try:
+            import cv2
+            cap = cv2.VideoCapture(str(path))
+            h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0) if cap.isOpened() else 0
+            cap.release()
+        except Exception:
+            h = 0
+        try:
+            (output_dir / ".dlqh.txt").write_text(str(h) if h else "", encoding="utf-8")
             (output_dir / ".dlqn.txt").write_text(str(qn or ""), encoding="utf-8")
         except OSError:
             pass
@@ -241,7 +250,7 @@ def download_bilibili_video_native(
                     continue
                 out = output_dir / "video.m4s"
                 _download_stream(base, _session_headers(url, use_cookie), out)
-                _record(vid)
+                _record(out, vid)
                 return out
         except Exception as exc:
             last = exc
@@ -250,7 +259,7 @@ def download_bilibili_video_native(
             direct, qn = _find_durl(url, cid, use_cookie, quality)
             out = output_dir / "video.mp4"
             _download_stream(direct, _session_headers(url, use_cookie), out)
-            _record(qn)
+            _record(out, qn)
             return out
         except Exception as exc:
             last = exc

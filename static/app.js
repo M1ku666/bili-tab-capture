@@ -4037,9 +4037,18 @@ const QN_LABEL = { 6:"240P",16:"360P",32:"480P",64:"720P",74:"720P60",80:"1080P"
 function setPreviewQnBadge(qn) {
   const badge = document.getElementById("previewQnBadge");
   if (!badge) return;
-  const n = qn == null ? null : Number(qn);
-  const label = n && QN_LABEL[n] ? QN_LABEL[n] : (qn ? String(qn) : null);
-  if (!label) { badge.classList.add("hidden"); badge.textContent = ""; return; }
+  let label = null;
+  if (qn && typeof qn === 'string' && qn.startsWith('px:')) {
+    const h = parseInt(qn.slice(3), 10);
+    if (h) label = String(h) + 'P';
+  } else if (qn && typeof qn === 'string' && qn.startsWith('q:')) {
+    const n = Number(qn.slice(2));
+    label = (n && QN_LABEL[n]) ? QN_LABEL[n] : (n ? String(n) : null);
+  } else {
+    const n = qn == null ? null : Number(qn);
+    label = n && QN_LABEL[n] ? QN_LABEL[n] : (qn ? String(qn) : null);
+  }
+  if (!label) { badge.classList.add('hidden'); badge.textContent = ''; return; }
   badge.textContent = label;
-  badge.classList.remove("hidden");
+  badge.classList.remove('hidden');
 }
