@@ -51,6 +51,7 @@
                 <code>mov</code>
                 <code>webm</code>
                 <code>mkv</code>
+                <code>m4s</code>
                 <code>png</code>
                 <code>jpg</code>
                 <code>webp</code>
@@ -60,7 +61,7 @@
               <span class="file-note">可拖入文件或 Ctrl+V 粘贴图片</span>
             </span>
             <input id="localFile" name="file" type="file"
-              accept="video/mp4,video/quicktime,video/webm,video/x-matroska,image/png,image/jpeg,image/webp,image/bmp,image/gif"
+              accept="video/mp4,video/quicktime,video/webm,video/x-matroska,.m4s,image/png,image/jpeg,image/webp,image/bmp,image/gif"
               autocomplete="off">
           </label>
         </div>
@@ -89,6 +90,7 @@
       <p id="previewTimeHint" class="preview-time-hint"></p>
       <div class="preview-frame" id="previewFrame" aria-busy="false">
         <img id="previewImage" alt="视频预览">
+        <span class="preview-qn hidden" id="previewQnBadge"></span>
         <div class="crop-overlay" id="cropOverlay">
           <div class="shade shade-top" id="shadeTop"></div>
           <div class="shade shade-bottom" id="shadeBottom"></div>

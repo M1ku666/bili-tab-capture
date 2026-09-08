@@ -936,6 +936,7 @@ async function loadPreview(timeValue) {
     });
     if (requestId !== state.previewRequestId || sourceId !== state.sourceId) return;
     els.previewImage.src = `${data.preview_url}?v=${Date.now()}`;
+    setPreviewQnBadge((data && (data.quality || "").toString()) || null);
     state.previewTime = time;
     updatePreviewTimeHint();
     clearPreviewStatus();
@@ -2893,7 +2894,7 @@ els.localFile.addEventListener("change", () => {
 function isImportableFile(file) {
   if (!file) return false;
   if (file.type && (file.type.startsWith("video/") || file.type.startsWith("image/"))) return true;
-  return /\.(mp4|mov|mkv|webm|png|jpe?g|webp|bmp|gif)$/i.test(file.name);
+  return /\.(mp4|mov|mkv|webm|m4s|png|jpe?g|webp|bmp|gif)$/i.test(file.name);
 }
 
 let fileDragDepth = 0;
@@ -4030,3 +4031,15 @@ function persistStep2Params() {
 document.addEventListener("pointerup", () => {
   if (state && state.sourceId && typeof persistStep2Params === "function") persistStep2Params();
 });
+
+/* 裁剪预览左上角：显示实际下载清晰度角标 */
+const QN_LABEL = { 6:"240P",16:"360P",32:"480P",64:"720P",74:"720P60",80:"1080P",100:"修复",112:"1080P+",116:"1080P60",120:"4K",125:"HDR",126:"杜比",127:"8K" };
+function setPreviewQnBadge(qn) {
+  const badge = document.getElementById("previewQnBadge");
+  if (!badge) return;
+  const n = qn == null ? null : Number(qn);
+  const label = n && QN_LABEL[n] ? QN_LABEL[n] : (qn ? String(qn) : null);
+  if (!label) { badge.classList.add("hidden"); badge.textContent = ""; return; }
+  badge.textContent = label;
+  badge.classList.remove("hidden");
+}

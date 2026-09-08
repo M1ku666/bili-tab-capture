@@ -117,11 +117,26 @@ def extract_bvid(url: str) -> str:
     return m.group(0)
 
 
-def _find_durl(url: str, cid: int, cookie: Optional[str], quality: Optional[int]) -> str:
-    """请求 playurl 拿到单文件 MP4 流的直链，返回该直链 URL。
+def _probe_ok(url: str, headers: dict) -> bool:
+    """试探该直链能否真正下到第一块(而非返回 4xx 放防盗页面)。"""
+    try:
+        resp = _session.get(url, headers=headers, stream=True, timeout=12,
+                            impersonate="chrome124")
+        try:
+            if resp.status_code != 200:
+                return False
+            next(resp.iter_content(chunk_size=1), None)  # 真实读，有些会延迟返回状态
+            return True
+        finally:
+            resp.close()
+    except Exception:
+        return False
 
-    先用默认/指定清晰度尝试；拿不到再按 _FALLBACK_QN 从高到低降级。
-    未登录时 B 站会自动把高 qn 降到可用档。
+
+def _find_durl(url: str, cid: int, cookie: Optional[str], quality: Optional[int]) -> "tuple[str, int]":
+    """请求 playurl 拿单文件 MP4 直链；返回 (可下载url, 所用清晰度qn)。
+
+    登录态下个别视频高清单文件流会 404(防盗链); 这里逐档试到能真正取到为止。
     """
     bvid = extract_bvid(url)
     attempts = []
@@ -136,23 +151,60 @@ def _find_durl(url: str, cid: int, cookie: Optional[str], quality: Optional[int]
             "https://api.bilibili.com/x/player/playurl?bvid=%s&cid=%s&qn=%s&fnval=0&fnver=0&fourk=1"
             % (bvid, cid, q)
         )
-        resp = _session.get(playurl, headers=_session_headers(url, cookie), timeout=15)
+        resp = _session.get(playurl, headers=_session_headers(url, cookie), timeout=15,
+                            impersonate="chrome124")
         resp.raise_for_status()
         data = resp.json().get("data") or {}
         durl = data.get("durl") or []
-        if durl:
-            direct = durl[0].get("url")
-            if direct:
-                return direct
+        if not durl:
+            continue
+        direct = durl[0].get("url")
+        if not direct:
+            continue
+        if _probe_ok(direct, _session_headers(url, cookie)):
+            return direct, q
     raise RuntimeError("无法获取可下载的 MP4 播放地址，可能需要登录。")
 
 
 def _download_stream(url: str, headers: dict, dest: Path) -> None:
-    resp = _session.get(url, headers=headers, stream=True, timeout=30)
+    resp = _session.get(url, headers=headers, stream=True, timeout=30,
+                        impersonate="chrome124")
     resp.raise_for_status()
     with open(dest, "wb") as f:
         for chunk in resp.iter_content(chunk_size=1024 * 1024):
             f.write(chunk)
+
+
+def dash_video_candidates(url: str, cookie: Optional[str], max_qn: Optional[int]) -> list:
+    """从视频页 SSR(playinfo) 取 DASH 视频轨候选；码率 aac? 只要 video codecid=AVC(7) 可读。
+
+    返回 [(videoid, codecid, baseUrl, hasUrl)]
+    """
+    import re as r, json as j
+    try:
+        h = _session_headers(url, cookie)
+        html = _session.get(url, headers=h, timeout=15, impersonate="chrome124").text
+    except Exception:
+        return []
+    m = r.search(r'window\.__playinfo__\s*=\s*(\{.*?\})\s*</script>', html, r.S)
+    if not m:
+        return []
+    try:
+        data = j.loads(m.group(1)).get("data") or {}
+    except Exception:
+        return []
+    dash = data.get("dash") or {}
+    out = []
+    for v in dash.get("video") or []:
+        cc = int(v.get("codecid") or -1)
+        base = v.get("baseUrl") or v.get("base_url")
+        if cc != 7 or not base:
+            continue
+        vid = int(v.get("id") or 0)
+        if max_qn and vid > max_qn:
+            continue
+        out.append((vid, cc, base))
+    return out
 
 
 def download_bilibili_video_native(
@@ -163,11 +215,43 @@ def download_bilibili_video_native(
 ) -> Path:
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        cid = _get_cid(url, cookie)
+    except Exception:
+        cid = _get_cid(url, None)
+    qmap = {6:6,16:16,32:32,64:64,74:74,80:80,112:112,116:116,120:120}
 
-    cid = _get_cid(url, cookie)
-    direct_url = _find_durl(url, cid, cookie, quality)
+    def _record(qn):
+        try:
+            (output_dir / ".dlqn.txt").write_text(str(qn or ""), encoding="utf-8")
+        except OSError:
+            pass
 
-    output_path = output_dir / "video.mp4"
-    headers = _session_headers(url, cookie)
-    _download_stream(direct_url, headers, output_path)
-    return output_path
+    modes = [cookie] if cookie else [None]
+    if cookie is not None:
+        modes.append(None)
+    last = None
+    for use_cookie in dict.fromkeys(modes):  # 先去重用次
+        # 1) DASH 视频轨(无音频、不合并) —— SSR; 仅视频便于 OpenCV/取帧
+        try:
+            picks = dash_video_candidates(url, use_cookie, quality)
+            picks.sort(key=lambda x: x[0], reverse=True)
+            for vid, cc, base in picks[:6]:
+                if not _probe_ok(base, _session_headers(url, use_cookie)):
+                    continue
+                out = output_dir / "video.m4s"
+                _download_stream(base, _session_headers(url, use_cookie), out)
+                _record(vid)
+                return out
+        except Exception as exc:
+            last = exc
+        # 2) 回退单文件 mp4(durl)
+        try:
+            direct, qn = _find_durl(url, cid, use_cookie, quality)
+            out = output_dir / "video.mp4"
+            _download_stream(direct, _session_headers(url, use_cookie), out)
+            _record(qn)
+            return out
+        except Exception as exc:
+            last = exc
+    raise last if last else RuntimeError("下载失败。")

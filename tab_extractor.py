@@ -37,7 +37,7 @@ HEADER_LINE_HEIGHT_RATIO = 1.2  # 标题/作者行高 = 字号 × 该比例（�
 
 import bili
 
-VIDEO_FILE_EXTENSIONS = (".mp4", ".mkv", ".webm", ".mov")
+VIDEO_FILE_EXTENSIONS = (".mp4", ".mkv", ".webm", ".mov", ".m4s")
 BILIBILI_USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
     "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"

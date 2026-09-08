@@ -2485,3 +2485,20 @@ button:disabled {
   grid-template-columns: 1fr;
 }
 .upd-skip-row button { width: 100%; }
+
+/* 裁剪预览左上角的“清晰度”角标 */
+.preview-qn {
+  position: absolute;
+  top: 8px;
+  left: 8px;
+  padding: 2px 7px;
+  border-radius: 6px;
+  background: rgba(23, 107, 91, 0.88);
+  color: #fff;
+  font-size: 12px;
+  font-weight: 600;
+  line-height: 1.4;
+  z-index: 6;
+  pointer-events: none;
+  user-select: none;
+}

@@ -156,7 +156,7 @@ def current_version() -> str:
 
 APP_VERSION = current_version()
 
-ALLOWED_VIDEO_EXTENSIONS = {".mp4", ".mov", ".mkv", ".webm"}
+ALLOWED_VIDEO_EXTENSIONS = {".mp4", ".mov", ".mkv", ".webm", ".m4s"}
 ALLOWED_IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".gif"}
 MIN_SPLIT_PX = 30  # 横向分割后每段的最小绝对像素高度（与前端保持一致）
 
@@ -727,8 +727,8 @@ def run_bilibili_download(source_id: str, url: str, cache_dir: Path, bvid: str) 
     """Background Bilibili download started at import time."""
     try:
         path = download_bilibili_video(url, cache_dir)
-        # 统一重命名为 BVxxxx.mp4，避免直接用视频标题（可能含中文/特殊字符）作文件名。
-        target = cache_dir / f"{bvid}.mp4"
+        # 统一按 BV 命名(保留实际后缀 .mp4/.m4s)，避免标题的非法字符作文件名。
+        target = cache_dir / (f"{bvid}" + Path(path).suffix.lower())
         if path.resolve() != target.resolve():
             shutil.move(str(path), str(target))
         path = target
@@ -939,7 +939,7 @@ def import_source():
                         job_id = make_cached_job(source_id, cache_dir, state)
                         source["restore"] = {"job_id": job_id, "images": restore_images(state), "layout": state.get("layout"), "maxStage": state.get("maxStage")}
             else:
-                return json_error("不支持的文件格式，请使用视频（mp4/mov/mkv/webm）或图片（png/jpg/webp/bmp/gif）。")
+                return json_error("不支持的文件格式，请使用视频（mp4/mov/mkv/webm/m4s）或图片（png/jpg/webp/bmp/gif）。")
         else:
             return json_error("请填写 BV 号，或选择本地视频。")
 
@@ -1140,7 +1140,7 @@ def _history_entries():
             kind_label = {"bilibili": "B站视频", "image": "图片", "local": "本地视频"}.get(kind, kind)
             mg = (state or {}).get("maxStage") if state else None
 
-            def _playable(directory: Path, exts=(".mp4", ".mkv", ".webm", ".mov")):
+            def _playable(directory: Path, exts=(".mp4", ".mkv", ".webm", ".mov", ".m4s", ".m4s")):
                 for p in directory.iterdir():
                     if p.is_file() and p.name.lower().endswith(exts):
                         return p
@@ -1289,7 +1289,7 @@ def api_history_restore():
     source_id = uuid.uuid4().hex
     if kind == "bilibili":
         fid = next((p for p in cache_dir.iterdir()
-                    if p.is_file() and p.name.lower().endswith((".mp4", ".mkv", ".webm", ".mov"))), None)
+                    if p.is_file() and p.name.lower().endswith((".mp4", ".mkv", ".webm", ".mov", ".m4s"))), None)
         try:
             dl = get_video_duration(fid) if fid is not None else None
         except Exception:
@@ -1322,7 +1322,7 @@ def api_history_restore():
             has_images = False
     else:  # local
         vid = next((p for p in cache_dir.iterdir()
-                    if p.is_file() and p.name.lower().endswith((".mp4", ".mkv", ".webm", ".mov"))), None)
+                    if p.is_file() and p.name.lower().endswith((".mp4", ".mkv", ".webm", ".mov", ".m4s"))), None)
         if not vid:
             return json_error("本地视频文件缺失。", 404)
         try:
@@ -1482,13 +1482,23 @@ def preview_source():
         preview_name = f"{source['id']}_{int(time_sec * 1000)}_{uuid.uuid4().hex[:8]}.jpg"
         preview_path = PREVIEWS_DIR / preview_name
 
+        resp_quality = None
         if source["type"] == "bilibili":
             cached = Path(source.get("video_path") or "")
+            base_dir = Path(source.get("cache_dir")) if source.get("cache_dir") else cached.parent
             if cached.exists():
                 video_path = cached
             else:
-                video_path = cached_remote_preview_video(source)
+                # 预览也用“最终下载的同一清晰度”：缓存目录下载整份（非 low 预览副本）
+                video_path = download_bilibili_video(source["url"], base_dir)
+                source["video_path"] = str(video_path)
             save_video_frame(video_path, preview_path, time_sec=time_sec)
+            dl = base_dir / ".dlqn.txt"
+            if dl.exists():
+                try:
+                    resp_quality = dl.read_text(encoding="utf-8").strip()
+                except OSError:
+                    pass
         else:
             save_video_frame(Path(source["path"]), preview_path, time_sec=time_sec)
 
@@ -1496,6 +1506,7 @@ def preview_source():
             {
                 "preview_url": f"/api/previews/{preview_name}",
                 "duration": source.get("duration"),
+                "quality": resp_quality,
             }
         )
     except Exception as exc:
