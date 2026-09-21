@@ -2502,3 +2502,12 @@ button:disabled {
   pointer-events: none;
   user-select: none;
 }
+
+/* 带 [hidden] 的字段必须真的隐藏（.field 的 display 会覆盖 hidden 默认样式） */
+.field[hidden],
+.time-field[hidden] { display: none !important; }
+
+/* PDF 清晰度（DPI）：独占一整行（.form-grid 是两列，跨满全部列） */
+#pdfDpiField {
+  grid-column: 1 / -1;
+}

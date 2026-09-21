@@ -14,6 +14,8 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import bili
+import pdf_render
+from pdf_render import PDF_DPI_DEFAULT, PdfRenderError
 from runtime_paths import data_dir, resource_dir
 from flask import Flask, jsonify, render_template, request, send_file, send_from_directory
 from werkzeug.utils import secure_filename
@@ -75,6 +77,11 @@ def image_cache_dir(file_hash: str) -> Path:
     return CACHE_DIR / "img" / file_hash
 
 
+def pdf_cache_dir(file_hash: str) -> Path:
+    """PDF 的哈希缓存目录（存 master.pdf、逐页渲染图与 state.json）。"""
+    return CACHE_DIR / "pdf" / file_hash
+
+
 def _cache_clearable(cache_dir: Path) -> bool:
     """仅允许清除已知的缓存子目录，避免越界删除。"""
     try:
@@ -83,7 +90,7 @@ def _cache_clearable(cache_dir: Path) -> bool:
         rel = cache_dir.relative_to(root)
     except (OSError, ValueError):
         return False
-    return rel.parts and rel.parts[0] in {"bv", "local", "img"}
+    return rel.parts and rel.parts[0] in {"bv", "local", "img", "pdf"}
 
 
 def has_restorable_cache(cache_dir: Path, state: Optional[Dict[str, Any]] = None) -> bool:
@@ -158,6 +165,43 @@ APP_VERSION = current_version()
 
 ALLOWED_VIDEO_EXTENSIONS = {".mp4", ".mov", ".mkv", ".webm", ".m4s"}
 ALLOWED_IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".gif"}
+ALLOWED_PDF_EXTENSIONS = {".pdf"}
+
+
+def load_rendered_pages(pdf_path: Path, pages_dir: Path, dpi: int) -> List[Dict[str, Any]]:
+    """把 PDF 逐页渲染成 pages_dir/page_XXXX.png，返回按页序的清单。
+
+    每项：{"file","url","t","w","h","page"}；page 为 1 基页码，供卡片显示。
+    """
+    rendered = pdf_render.render_pdf_pages(pdf_path, pages_dir, dpi=dpi, prefix="page")
+    pages = []
+    for item in rendered:
+        pages.append({
+            "file": item["file"],
+            "url": "",
+            "t": 0.0,
+            "w": item["w"],
+            "h": item["h"],
+            "page": item["index"] + 1,
+        })
+    return pages
+
+
+def read_capture_dpi(value: Any) -> int:
+    """第 2 步的 PDF 渲染 DPI（存进 params2，可恢复）。"""
+    return pdf_render.clamp_dpi(value, PDF_DPI_DEFAULT)
+
+
+def _pages_complete(pages_dir: Path, total_pages: int) -> bool:
+    """cache/pages 里是否已按当前 DPI 渲染齐全部页面（缺页则需重渲）。"""
+    if not pages_dir.exists():
+        return False
+    for i in range(1, total_pages + 1):
+        if not (pages_dir / f"page_{i:04d}.png").exists():
+            return False
+    return True
+
+
 MIN_SPLIT_PX = 30  # 横向分割后每段的最小绝对像素高度（与前端保持一致）
 
 app = Flask(__name__)
@@ -630,7 +674,10 @@ def run_capture_job(job_id: str, payload: Dict[str, Any]) -> None:
 
 
 def start_image_capture(source: Dict[str, Any], payload: Dict[str, Any]):
-    """图片源不走视频提取，直接按裁剪参数切一张截图、立即产出任务。"""
+    """图片源不走视频提取，直接按裁剪参数切一张截图、立即产出任务。
+
+    PDF 源同路复用：按 crop* 裁切每一页渲染图，一页一张截图 = 第 3 步一张卡片。
+    """
     crop_y_start = parse_float(payload.get("crop_y_start"), "crop_y_start", 0.0)
     crop_y_end = parse_float(payload.get("crop_y_end"), "crop_y_end", 1)
     crop_x_start = parse_float(payload.get("crop_x_start"), "crop_x_start", 0.0)
@@ -643,45 +690,123 @@ def start_image_capture(source: Dict[str, Any], payload: Dict[str, Any]):
     evict_superseded_jobs(source["id"], run_dir_name=job_id)
     cleanup_source_transient(source["id"])
     run_dir = RUNS_DIR / job_id
-    crops_dir = run_dir / "crops"
+    # 有缓存目录的源（图片/PDF）把截图持久化到 cache/crops，历史记录与恢复才拿得到；
+    # 与视频源同一约定：job 的 crops_dir 指向缓存目录。
+    cache_dir = Path(source["cache_dir"]) if source.get("cache_dir") else None
+    crops_dir = (cache_dir / "crops") if cache_dir is not None else (run_dir / "crops")
     crops_dir.mkdir(parents=True, exist_ok=True)
 
     metadata = metadata_from_dict(source.get("metadata", {}))
-    image = Image.open(source["path"]).convert("RGB")
-    w, h = image.size
-    box = (
-        int(round(w * crop_x_start)),
-        int(round(h * crop_y_start)),
-        int(round(w * crop_x_end)),
-        int(round(h * crop_y_end)),
-    )
-    image = image.crop(box)
-    out_name = "crop_0000_t00000.png"
-    image.save(crops_dir / out_name)
-    nw, nh = image.size
-    capture = {
-        "file": out_name,
-        "url": f"/api/captures/{job_id}/{out_name}",
-        "t": 0.0,
-        "w": nw,
-        "h": nh,
-    }
-    stats = ExtractionStats(captures_kept=1).to_dict()
+    is_pdf = source.get("type") == "pdf"
+    dpi = parse_float(payload.get("pdf_dpi"), "pdf_dpi", PDF_DPI_DEFAULT)
+
+    captures: List[Dict[str, Any]] = []
+    if is_pdf:
+        # 页码区间（1 基，闭区间）：与视频的起止时间同一套交互，只是单位换成页。
+        total_pages = pdf_render.pdf_page_count(Path(source["path"]))
+        start_page = int(parse_float(payload.get("start_page"), "start_page", 1))
+        end_page = int(parse_float(payload.get("end_page"), "end_page", total_pages))
+        start_page = max(1, min(start_page, total_pages))
+        end_page = max(start_page, min(end_page, total_pages))
+
+        if not payload.get("pdf_dpi") and source.get("pdf_dpi"):
+            dpi = parse_float(source.get("pdf_dpi"), "pdf_dpi", PDF_DPI_DEFAULT)
+        dpi = pdf_render.clamp_dpi(dpi)
+
+        # 渲染缓存：整份 PDF 按当前 DPI 渲染到 cache/pages，换区间/重生成都不必重渲。
+        pages_dir = (cache_dir / "pages") if cache_dir is not None else crops_dir
+        stamp = pages_dir / f".dpi{dpi}.txt"
+        with tempfile.TemporaryDirectory() as tmp:
+            if cache_dir is not None and not (stamp.exists() and _pages_complete(pages_dir, total_pages)):
+                shutil.rmtree(pages_dir, ignore_errors=True)
+                load_rendered_pages(Path(source["path"]), pages_dir, dpi)
+                stamp.write_text(str(dpi), encoding="utf-8")
+            source_pages = pages_dir if cache_dir is not None else Path(tmp)
+            if cache_dir is None:
+                load_rendered_pages(Path(source["path"]), source_pages, dpi)
+
+            # 重新生成本源：先清掉上一批截图，避免改页码范围后留下不再生效的旧页。
+            for old in crops_dir.glob("page_*.png"):
+                old.unlink(missing_ok=True)
+
+            for page_no in range(start_page, end_page + 1):
+                page_file = source_pages / f"page_{page_no:04d}.png"
+                if not page_file.exists():
+                    continue
+                img = Image.open(page_file).convert("RGB")
+                w, h = img.size
+                box = (
+                    int(round(w * crop_x_start)),
+                    int(round(h * crop_y_start)),
+                    int(round(w * crop_x_end)),
+                    int(round(h * crop_y_end)),
+                )
+                img = img.crop(box)
+                out_name = f"page_{page_no:04d}.png"
+                img.save(crops_dir / out_name)
+                captures.append({
+                    "file": out_name,
+                    "url": f"/api/captures/{job_id}/{out_name}",
+                    "t": 0.0,
+                    "w": img.width,
+                    "h": img.height,
+                    "page": page_no,
+                })
+        if not captures:
+            raise ValueError("所选页码范围没有可用页面。")
+    else:
+        image = Image.open(source["path"]).convert("RGB")
+        w, h = image.size
+        box = (
+            int(round(w * crop_x_start)),
+            int(round(h * crop_y_start)),
+            int(round(w * crop_x_end)),
+            int(round(h * crop_y_end)),
+        )
+        image = image.crop(box)
+        out_name = "crop_0000_t00000.png"
+        image.save(crops_dir / out_name)
+        captures.append({
+            "file": out_name,
+            "url": f"/api/captures/{job_id}/{out_name}",
+            "t": 0.0,
+            "w": image.width,
+            "h": image.height,
+        })
+
+    stats = ExtractionStats(captures_kept=len(captures)).to_dict()
     with STORE_LOCK:
         JOBS[job_id] = {
             "id": job_id,
             "source_id": source["id"],
             "status": "done",
             "phase": "done",
-            "logs": ["已导入图片。"],
+            "logs": [f"已从 PDF 生成 {len(captures)} 张（每页一张）。" if is_pdf else "已导入图片。"],
             "stats": stats,
-            "captures": [capture],
+            "captures": captures,
             "metadata": metadata_to_dict(metadata),
             "error": None,
             "pdf_url": None,
             "created_at": time.time(),
             "updated_at": time.time(),
         }
+        if cache_dir is not None:
+            JOBS[job_id]["crops_dir"] = str(crops_dir)
+            JOBS[job_id]["cache_dir"] = str(cache_dir)
+
+    # 持久化截图态：历史记录/恢复进度都依赖 cache/crops + state.json。
+    if cache_dir is not None:
+        state = load_state_json(cache_dir) or {}
+        state["captures"] = captures
+        state["images"] = restore_images({"captures": captures})
+        state["metadata"] = state.get("metadata") or metadata_to_dict(metadata)
+        if is_pdf:
+            state["pdf_dpi"] = dpi
+            state["page_count"] = total_pages
+            state["page_range"] = {"start": start_page, "end": end_page}
+        state.setdefault("capture_params", {})
+        state.setdefault("maxStage", 3)
+        save_state_json(cache_dir, state)
     return jsonify({"job_id": job_id})
 
 
@@ -788,6 +913,31 @@ def restore_images(state: Dict[str, Any]) -> List[Dict[str, Any]]:
     ]
 
 
+def source_title_from_filename(raw_name: str) -> str:
+    """从上传文件的**原始文件名**取出可读标题。
+
+    注意：`secure_filename()` 会剥掉全部非 ASCII 字符（中文名会整个消失，
+    "肖邦夜曲.pdf" → "pdf"），因此**标题绝不能从 secure_filename 的结果取**，
+    必须用 `upload.filename` 本名，只做最小清理（去扩展名/去目录成分）。
+    """
+    name = (raw_name or "").replace("\\", "/").split("/")[-1]
+    name = name.replace("\x00", "").strip()
+    stem = Path(name).stem if name else ""
+    return stem.strip() or "未命名"
+
+
+def safe_upload_name(raw_name: str, suffix: str) -> str:
+    """给**落盘**用的安全文件名（ASCII 兜底，避免路径穿越/非法字符）。
+
+    中文名会被剥空，此处回退成 "upload<扩展名>"——文件本身以哈希目录存储，
+    磁盘上的名字只用于中转，可读性无关紧要。
+    """
+    cleaned = secure_filename((raw_name or "").replace("\\", "/").split("/")[-1])
+    if not cleaned or cleaned == suffix.lstrip("."):
+        return f"upload{suffix}"
+    return cleaned
+
+
 @app.post("/api/import")
 def import_source():
     ensure_cache_dirs()
@@ -839,7 +989,10 @@ def import_source():
                     daemon=True,
                 ).start()
         elif upload and upload.filename:
-            original_name = secure_filename(upload.filename)
+            raw_name = upload.filename
+            # 标题取原始文件名（保住中文）；落盘名用 ASCII 安全版。
+            display_title = source_title_from_filename(raw_name)
+            original_name = safe_upload_name(raw_name, Path(raw_name).suffix.lower())
             suffix = Path(original_name).suffix.lower()
             source_id = uuid.uuid4().hex
             upload_dir = UPLOADS_DIR / source_id
@@ -848,7 +1001,7 @@ def import_source():
             upload.save(saved_path)
 
             if suffix in ALLOWED_IMAGE_EXTENSIONS:
-                metadata = build_video_metadata(raw_title=Path(original_name).stem)
+                metadata = build_video_metadata(raw_title=display_title)
                 file_hash = hash_file(saved_path)
                 cache_dir = image_cache_dir(file_hash)
                 cache_dir.mkdir(parents=True, exist_ok=True)
@@ -904,9 +1057,46 @@ def import_source():
                     source["has_cache"] = True
                     source["cache"] = {"cache_dir": str(cache_dir), "type": "image", "key": file_hash,
                                        "title": metadata.display_title or metadata.raw_title}
+            elif suffix in ALLOWED_PDF_EXTENSIONS:
+                file_hash = hash_file(saved_path)
+                metadata = build_video_metadata(raw_title=display_title)
+                cache_dir = pdf_cache_dir(file_hash)
+                cache_dir.mkdir(parents=True, exist_ok=True)
+                master = cache_dir / "master.pdf"
+                if not master.exists():
+                    shutil.move(str(saved_path), str(master))
+                else:
+                    saved_path.unlink(missing_ok=True)
+
+                dpi = read_capture_dpi((load_state_json(cache_dir) or {}).get("pdf_dpi"))
+                page_count = pdf_render.pdf_page_count(master)
+                source = {
+                    "id": source_id,
+                    "type": "pdf",
+                    "path": str(master),
+                    "metadata": metadata_to_dict(metadata),
+                    "duration": None,
+                    "page_count": page_count,
+                    "dpi": dpi,
+                    "pdf_dpi": dpi,
+                    "cache_dir": str(cache_dir),
+                    "download": {"status": "done", "message": None},
+                }
+                state = load_state_json(cache_dir)
+                has_img = _has_images(cache_dir, state)
+                has_par = _has_params(state)
+                if has_img or has_par:
+                    source["has_cache"] = True
+                    source["cache"] = {"cache_dir": str(cache_dir), "type": "pdf", "key": file_hash,
+                                       "title": metadata.display_title or metadata.raw_title}
+                    source["params2"] = read_capture_prefs(state)
+                    if has_img:
+                        job_id = make_cached_job(source_id, cache_dir, state)
+                        source["restore"] = {"job_id": job_id, "images": restore_images(state),
+                                             "layout": state.get("layout"), "maxStage": state.get("maxStage")}
             elif suffix in ALLOWED_VIDEO_EXTENSIONS:
                 duration = get_video_duration(saved_path)
-                metadata = build_video_metadata(raw_title=Path(original_name).stem)
+                metadata = build_video_metadata(raw_title=display_title)
                 file_hash = hash_file(saved_path)
                 cache_dir = local_cache_dir(file_hash)
                 cache_dir.mkdir(parents=True, exist_ok=True)
@@ -939,7 +1129,7 @@ def import_source():
                         job_id = make_cached_job(source_id, cache_dir, state)
                         source["restore"] = {"job_id": job_id, "images": restore_images(state), "layout": state.get("layout"), "maxStage": state.get("maxStage")}
             else:
-                return json_error("不支持的文件格式，请使用视频（mp4/mov/mkv/webm/m4s）或图片（png/jpg/webp/bmp/gif）。")
+                return json_error("不支持的文件格式，请使用视频（mp4/mov/mkv/webm/m4s）、图片（png/jpg/webp/bmp/gif）或 PDF。")
         else:
             return json_error("请填写 BV 号，或选择本地视频。")
 
@@ -987,8 +1177,8 @@ def cache_clear():
 
     if kind == "bilibili":
         cache_dir = bilibili_cache_dir(safe_key)
-    elif kind in ("local", "image"):
-        cache_dir = image_cache_dir(safe_key) if kind == "image" else local_cache_dir(safe_key)
+    elif kind in _CACHE_DIR_BY_KIND:
+        cache_dir = _CACHE_DIR_BY_KIND[kind](safe_key)
     else:
         return json_error("未知缓存类型。", 400)
 
@@ -1003,6 +1193,11 @@ def cache_clear():
 
     for old in (cache_dir / "crops").glob("*.png"):
         old.unlink(missing_ok=True)
+    # PDF：渲染图也要一并清掉，否则“从新开始”后仍会命中旧 DPI 的渲染缓存。
+    for old in (cache_dir / "pages").glob("*.png"):
+        old.unlink(missing_ok=True)
+    for old in (cache_dir / "pages").glob(".dpi*.txt"):
+        old.unlink(missing_ok=True)
     (cache_dir / "state.json").unlink(missing_ok=True)
     # 注意：不清除 SOURCES/JOBS 里的内存 source——用户“从新开始”后仍要沿用同一个
     # source 继续处理当前文件，只是不再命中旧缓存。
@@ -1016,12 +1211,17 @@ _CACHE_KIND_DIR = {
     "bilibili": "bv",
     "image": "img",
     "local": "local",
+    "pdf": "pdf",
 }
 _CACHE_DIR_BY_KIND = {
     "bilibili": bilibili_cache_dir,
     "image": image_cache_dir,
     "local": local_cache_dir,
+    "pdf": pdf_cache_dir,
 }
+# PDF 源在“卡片/截图”层面完全复用图片的那套逻辑（裁剪、去色、分页排版），
+# 因此除缓存目录与渲染方式不同外，其余分支都与 image 合并处理。
+IMAGE_LIKE_TYPES = {"image", "pdf"}
 _FILENAME_RE = re.compile(r"[^A-Za-z0-9._-]")
 
 
@@ -1078,6 +1278,11 @@ PARAMS2_DEFAULTS = {
     "cropEnd": 1.0,
     "cropLeft": 0.0,
     "cropRight": 1.0,
+    # PDF 逐页渲染分辨率（仅 PDF 源使用；默认 200，可在第 2 步修改）
+    "pdf_dpi": PDF_DPI_DEFAULT,
+    # PDF 页码区间（1 基闭区间；仅 PDF 源使用）
+    "startPage": 1,
+    "endPage": None,
 }
 
 
@@ -1137,7 +1342,7 @@ def _history_entries():
             meta = (state or {}).get("metadata") or {}
             title = _entry_title(state) or key
             chnl = meta.get("channel") or ""
-            kind_label = {"bilibili": "B站视频", "image": "图片", "local": "本地视频"}.get(kind, kind)
+            kind_label = {"bilibili": "B站视频", "image": "图片", "local": "本地视频", "pdf": "PDF"}.get(kind, kind)
             mg = (state or {}).get("maxStage") if state else None
 
             def _playable(directory: Path, exts=(".mp4", ".mkv", ".webm", ".mov", ".m4s", ".m4s")):
@@ -1154,6 +1359,10 @@ def _history_entries():
                 master = next((p for p in cd.iterdir()
                                if p.is_file() and p.name.lower().startswith("master")), None)
                 resumable = bool(master) or bool(state and state.get("captures"))
+            elif kind == "pdf":
+                # PDF：master.pdf 在就能重新渲染 → 可恢复；渲染图缺失时重导会重渲。
+                master = (cd / "master.pdf")
+                resumable = master.exists() or bool(state and state.get("captures"))
             out.append({
                 "kind": kind,          # bilibili|image|local
                 "label": kind_label,
@@ -1304,22 +1513,37 @@ def api_history_restore():
         }
         if fid:
             source["video_path"] = str(fid)
-    elif kind == "image":
+    elif kind in ("image", "pdf"):
         master = next((p for p in cache_dir.iterdir()
                        if p.is_file() and p.name.lower().startswith("master")), None)
-        source = {
-            "id": source_id, "type": "image",
-            "path": str(master) if master else (next((p for p in cache_dir.iterdir()
-                                                      if p.is_file() and p.suffix.lower() in (".png", ".jpg", ".jpeg")), None)),
-            "metadata": meta, "duration": None,
-            "cache_dir": str(cache_dir),
-            "download": {"status": "done", "message": None},
-        }
-        if not source["path"]:
-            return json_error("图片原文件缺失。", 404)
-        if not has_images:
-            # 无截图态：走 /start_image_capture 前前端会直接读原图
-            has_images = False
+        if kind == "pdf":
+            if master is None:
+                return json_error("PDF 原文件缺失。", 404)
+            state = load_state_json(cache_dir) or {}
+            source = {
+                "id": source_id, "type": "pdf",
+                "path": str(master),
+                "metadata": meta, "duration": None,
+                "page_count": state.get("page_count"),
+                "dpi": read_capture_dpi(state.get("pdf_dpi")),
+                "pdf_dpi": read_capture_dpi(state.get("pdf_dpi")),
+                "cache_dir": str(cache_dir),
+                "download": {"status": "done", "message": None},
+            }
+        else:
+            source = {
+                "id": source_id, "type": "image",
+                "path": str(master) if master else (next((p for p in cache_dir.iterdir()
+                                                          if p.is_file() and p.suffix.lower() in (".png", ".jpg", ".jpeg")), None)),
+                "metadata": meta, "duration": None,
+                "cache_dir": str(cache_dir),
+                "download": {"status": "done", "message": None},
+            }
+            if not source["path"]:
+                return json_error("图片原文件缺失。", 404)
+            if not has_images:
+                # 无截图态：走 /start_image_capture 前前端会直接读原图
+                has_images = False
     else:  # local
         vid = next((p for p in cache_dir.iterdir()
                     if p.is_file() and p.name.lower().endswith((".mp4", ".mkv", ".webm", ".mov", ".m4s"))), None)
@@ -1374,6 +1598,10 @@ def api_save_capture_prefs():
         "metadata": src.get("metadata") or {},
     }
     state["params2"] = clean
+    # PDF 的 DPI 也单独存一份：导入/恢复时无需解 params2 就能拿到渲染分辨率。
+    if "pdf_dpi" in clean:
+        state["pdf_dpi"] = read_capture_dpi(clean["pdf_dpi"])
+        src["pdf_dpi"] = state["pdf_dpi"]
     if "maxStage" not in state or state.get("maxStage") in (None, 0):
         state["maxStage"] = 2
     save_state_json(cache_dir, state)
@@ -1479,6 +1707,28 @@ def preview_source():
         if time_sec < 0:
             raise ValueError("时间必须大于等于 0")
 
+        # PDF 源：time 是页号（1 基），预览 = 该页渲染图缩成 jpg（与视频预览同一套返回结构）。
+        if source["type"] == "pdf":
+            page_no = max(1, int(round(time_sec)) or 1)
+            dpi = read_capture_dpi(data.get("dpi") if data.get("dpi") else source.get("pdf_dpi"))
+            total = pdf_render.pdf_page_count(Path(source["path"]))
+            page_no = min(page_no, total)
+            preview_name = f"{source['id']}_p{page_no}_{uuid.uuid4().hex[:8]}.jpg"
+            preview_path = PREVIEWS_DIR / preview_name
+            image = pdf_render.render_pdf_page(Path(source["path"]), page_no - 1, dpi)
+            if image.width > 1400:
+                ratio = 1400 / image.width
+                image = image.resize((1400, max(1, int(image.height * ratio))), RESAMPLE)
+            image.convert("RGB").save(preview_path, quality=88)
+            image.close()
+            return jsonify({
+                "preview_url": f"/api/previews/{preview_name}",
+                "duration": None,
+                "quality": None,
+                "page": page_no,
+                "page_count": total,
+            })
+
         preview_name = f"{source['id']}_{int(time_sec * 1000)}_{uuid.uuid4().hex[:8]}.jpg"
         preview_path = PREVIEWS_DIR / preview_name
 
@@ -1531,7 +1781,7 @@ def start_captures():
     payload = request.get_json(force=True, silent=True) or {}
     try:
         source = source_or_error(payload.get("source_id"))
-        if source["type"] == "image":
+        if source["type"] in IMAGE_LIKE_TYPES:
             return start_image_capture(source, payload)
         start_sec = parse_float(payload.get("start"), "start", 0.0)
         end_sec = parse_optional_float(payload.get("end"), "end")
@@ -2117,9 +2367,29 @@ def merge_image():
 def source_image(source_id: str):
     with STORE_LOCK:
         source = SOURCES.get(source_id)
-    if source is None or source.get("type") != "image":
+    if source is None or source.get("type") not in IMAGE_LIKE_TYPES:
         return json_error("未知的图片源。", 404)
+    if source.get("type") == "pdf":
+        return json_error("PDF 源请使用 /api/source_page 预览。", 400)
     return send_file(source["path"])
+
+
+@app.get("/api/source_info/<source_id>")
+def source_info(source_id: str):
+    """源的补充信息：PDF 的页数 / 当前 DPI（前端翻页与 DPI 输入框用）。"""
+    with STORE_LOCK:
+        source = SOURCES.get(source_id)
+    if source is None:
+        return json_error("未知的源。", 404)
+    info = {"type": source.get("type")}
+    if source.get("type") == "pdf":
+        info["dpi"] = read_capture_dpi(source.get("pdf_dpi"))
+        try:
+            info["page_count"] = pdf_render.pdf_page_count(Path(source["path"]))
+        except PdfRenderError as exc:
+            return json_error(str(exc))
+        source["page_count"] = info["page_count"]
+    return jsonify(info)
 
 
 @app.get("/api/jobs/<job_id>")

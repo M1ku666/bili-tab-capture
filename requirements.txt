@@ -4,3 +4,4 @@ opencv-python
 Pillow
 curl_cffi
 qrcode
+pymupdf

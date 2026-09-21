@@ -44,7 +44,7 @@
         <div class="import-secondary-row">
           <label class="field file-field">
             <span class="file-icon" data-icon="upload" aria-hidden="true"></span>
-            <span class="file-hint">本地视频或图片</span>
+            <span class="file-hint">本地视频、图片或 PDF</span>
             <span class="file-meta">
               <span class="file-formats">
                 <code>mp4</code>
@@ -57,11 +57,12 @@
                 <code>webp</code>
                 <code>bmp</code>
                 <code>gif</code>
+                <code>pdf</code>
               </span>
               <span class="file-note">可拖入文件或 Ctrl+V 粘贴图片</span>
             </span>
             <input id="localFile" name="file" type="file"
-              accept="video/mp4,video/quicktime,video/webm,video/x-matroska,.m4s,image/png,image/jpeg,image/webp,image/bmp,image/gif"
+              accept="video/mp4,video/quicktime,video/webm,video/x-matroska,.m4s,image/png,image/jpeg,image/webp,image/bmp,image/gif,application/pdf,.pdf"
               autocomplete="off">
           </label>
         </div>
@@ -112,7 +113,8 @@
         <summary>高级设置</summary>
         <div class="form-grid advanced-grid">
           <div class="time-row" id="timeRow">
-            <div class="field time-field">
+            <!-- 视频源：开始/结束时间（分:秒） -->
+            <div class="field time-field" id="startTimeField">
               <span>开始</span>
               <div class="time-inputs">
                 <div class="time-part">
@@ -127,6 +129,17 @@
                 </div>
               </div>
             </div>
+            <!-- PDF 源：开始/结束页数 -->
+            <div class="field time-field" id="startPageField" hidden>
+              <span>开始页</span>
+              <div class="time-inputs">
+                <div class="time-part">
+                  <input id="startPageInput" type="number" min="1" step="1" value="1" aria-label="开始页数"
+                    autocomplete="off">
+                  <span>页</span>
+                </div>
+              </div>
+            </div>
 
             <div class="timeline" id="timeline" aria-label="选择开始和结束时间">
               <div class="timeline-track" id="timelineTrack">
@@ -136,11 +149,11 @@
                 aria-label="开始时间"></button>
               <button class="timeline-handle timeline-handle-end" id="timelineEndHandle" type="button"
                 aria-label="结束时间"></button>
-              <span class="timeline-label timeline-label-start">00:00</span>
+              <span class="timeline-label timeline-label-start" id="timelineStartLabel">00:00</span>
               <span class="timeline-label timeline-label-end" id="timelineEndLabel"></span>
             </div>
 
-            <div class="field time-field">
+            <div class="field time-field" id="endTimeField">
               <span>结束</span>
               <div class="time-inputs">
                 <div class="time-part">
@@ -153,7 +166,22 @@
                 </div>
               </div>
             </div>
+            <div class="field time-field" id="endPageField" hidden>
+              <span>结束页</span>
+              <div class="time-inputs">
+                <div class="time-part">
+                  <input id="endPageInput" type="number" min="1" step="1" value="1" aria-label="结束页数"
+                    autocomplete="off">
+                  <span>页</span>
+                </div>
+              </div>
+            </div>
           </div>
+          <label class="field" id="pdfDpiField" hidden>
+            <span>PDF 清晰度 <span class="help-tip" data-tip="PDF 每页渲染成图片的分辨率（DPI）。数值越大谱面越清晰，但生成更慢、文件更大。默认 200。" tabindex="0"
+                role="button" aria-label="PDF 清晰度说明">?</span></span>
+            <input id="pdfDpi" type="number" min="50" max="600" step="10" value="200" autocomplete="off">
+          </label>
           <label class="field">
             <span>采样间隔 <span class="help-tip" data-tip="每隔多少秒截一帧画面。数值越小越不容易漏小节，但截图更多、处理更慢。" tabindex="0" role="button"
                 aria-label="采样间隔说明">?</span></span>

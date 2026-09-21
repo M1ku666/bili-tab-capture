@@ -33,6 +33,9 @@ const state = {
   recolorPreviewTimer: null, // 第四步着色预览节流
   latestVersion: null, // 检查更新得到的最新版本号
   skippedVersion: null, // 跳过的版本号（不在启动时弹窗）
+  // PDF 源：第 2 步复用视频时间轴（timeUnit="page" 时按页数取值）
+  pageCount: null,
+  timeUnit: "sec", // "sec"(视频) | "page"(PDF)
 };
 
 const JSON_HEADERS = { "Content-Type": "application/json" };
@@ -86,10 +89,15 @@ const els = {
   startSecInput: document.getElementById("startSecInput"),
   endMinInput: document.getElementById("endMinInput"),
   endSecInput: document.getElementById("endSecInput"),
+  startPageInput: document.getElementById("startPageInput"),
+  endPageInput: document.getElementById("endPageInput"),
+  timelineStartLabel: document.getElementById("timelineStartLabel"),
   sampleEvery: document.getElementById("sampleEvery"),
   diffThreshold: document.getElementById("diffThreshold"),
   bandHalfWidth: document.getElementById("bandHalfWidth"),
   compareWindow: document.getElementById("compareWindow"),
+  pdfDpiField: document.getElementById("pdfDpiField"),
+  pdfDpi: document.getElementById("pdfDpi"),
   generateButton: document.getElementById("generateButton"),
   extractStatus: document.getElementById("extractStatus"),
   extractProgressWrap: document.getElementById("extractProgressWrap"),
@@ -519,7 +527,11 @@ function formatSeconds(value) {
 }
 
 function updatePreviewTimeHint() {
-  els.previewTimeHint.textContent = state.previewTime === null ? "" : `当前预览：${formatSeconds(state.previewTime)}`;
+  if (state.previewTime === null) {
+    els.previewTimeHint.textContent = "";
+  } else {
+    els.previewTimeHint.textContent = `当前预览：${isPageMode() ? `第 ${Math.round(state.previewTime)} 页` : formatSeconds(state.previewTime)}`;
+  }
 }
 
 function readTimeParts(minInput, secInput) {
@@ -532,11 +544,20 @@ function readTimeParts(minInput, secInput) {
 }
 
 function currentStartTime() {
+  if (isPageMode()) {
+    const v = Number(els.startPageInput && els.startPageInput.value);
+    return Number.isFinite(v) && v >= 1 ? Math.round(v) : 1;
+  }
   const value = readTimeParts(els.startMinInput, els.startSecInput);
   return Number.isFinite(value) ? value : 0;
 }
 
 function currentEndTime() {
+  if (isPageMode()) {
+    const v = Number(els.endPageInput && els.endPageInput.value);
+    if (Number.isFinite(v) && v >= 1) return Math.round(v);
+    return timelineTotal() || 1;
+  }
   return readTimeParts(els.endMinInput, els.endSecInput);
 }
 
@@ -643,14 +664,41 @@ function clickCrop(event) {
 
 const MIN_TIMELINE_GAP = 0.5;
 
+/* 时间轴抽象：视频按「秒」，PDF 按「页」。同一套拖动/进度条逻辑复用，
+   只把取值与单位切换掉（state.timeUnit: "sec" | "page"）。 */
+function isPageMode() {
+  return state.timeUnit === "page";
+}
+
+/* 该源是否**没有可抽帧的原视频**（图片/PDF）。
+   这类源不能「从原视频插入」，判据要覆盖 pdf，不能只写 === "image"。 */
+function hasNoSourceVideo() {
+  return state.sourceType === "image" || state.sourceType === "pdf";
+}
+
+function timelineTotal() {
+  // 时间轴总长（秒或页数）
+  if (isPageMode()) return state.pageCount || 0;
+  return Number.isFinite(state.duration) && state.duration > 0 ? state.duration : 0;
+}
+
+// 时间轴上的最小间隔：视频 0.5 秒；PDF 至少 1 页
+function timelineMinGap() {
+  return isPageMode() ? 1 : MIN_TIMELINE_GAP;
+}
+
+function timelineLabel(value) {
+  return isPageMode() ? `第 ${Math.round(value)} 页` : formatSeconds(value);
+}
+
 function hasTimelineDuration() {
-  return Number.isFinite(state.duration) && state.duration > 0;
+  return timelineTotal() > 0;
 }
 
 function resolvedEndTime() {
   const end = currentEndTime();
   if (Number.isFinite(end)) return end;
-  return state.duration ?? 0;
+  return timelineTotal();
 }
 
 function setTimeInputs(minInput, secInput, totalSeconds) {
@@ -659,9 +707,36 @@ function setTimeInputs(minInput, secInput, totalSeconds) {
   secInput.value = String(whole % 60);
 }
 
+// 按当前单位把「开始/结束」写进对应输入框（PDF 写页码，视频写分:秒）。
+function setRangeInputs(which, value) {
+  if (isPageMode()) {
+    const el = which === "start" ? els.startPageInput : els.endPageInput;
+    if (el) el.value = String(Math.max(1, Math.round(value)));
+    return;
+  }
+  if (which === "start") setTimeInputs(els.startMinInput, els.startSecInput, value);
+  else setTimeInputs(els.endMinInput, els.endSecInput, value);
+}
+
 function timeToRatio(time) {
-  if (!hasTimelineDuration()) return 0;
-  return clamp(time / state.duration, 0, 1);
+  const total = timelineTotal();
+  if (!total) return 0;
+  // 页模式下「第 1 页」在左端，用 (page-1)/(total-1) 让首尾页正好贴住两端。
+  if (isPageMode()) {
+    const span = Math.max(1, total - 1);
+    return clamp((time - 1) / span, 0, 1);
+  }
+  return clamp(time / total, 0, 1);
+}
+
+function ratioToTime(ratio) {
+  const total = timelineTotal();
+  if (!total) return 0;
+  if (isPageMode()) {
+    const span = Math.max(1, total - 1);
+    return clamp(Math.round(1 + ratio * span), 1, total);
+  }
+  return clamp(ratio * total, 0, total);
 }
 
 function updateTimeline() {
@@ -670,7 +745,8 @@ function updateTimeline() {
     return;
   }
   els.timeline.classList.remove("is-disabled");
-  els.timelineEndLabel.textContent = formatSeconds(state.duration);
+  if (els.timelineStartLabel) els.timelineStartLabel.textContent = timelineLabel(isPageMode() ? 1 : 0);
+  els.timelineEndLabel.textContent = timelineLabel(timelineTotal());
   const startPct = timeToRatio(currentStartTime()) * 100;
   const endPct = timeToRatio(resolvedEndTime()) * 100;
   els.timelineStartHandle.style.left = `${startPct}%`;
@@ -687,18 +763,26 @@ function timelineRatioFromEvent(event) {
 function beginTimelineDrag(which, event) {
   if (!hasTimelineDuration()) return;
   event.preventDefault();
+  // 阻止冒泡到 els.timeline 的轨道拖动：否则轨道监听会把 timelineDrag 覆盖成
+  // 就近端点，并把 pointer capture 抢到轨道上，window 上的 dragTimeline 再也收不到
+  // 移动事件，表现就是“把手拖不动”。
+  event.stopPropagation();
   state.timelineDrag = which;
   event.currentTarget.setPointerCapture?.(event.pointerId);
 }
 
 function applyTimelineDrag(ratio) {
-  const time = ratio * state.duration;
+  const total = timelineTotal();
+  const value = ratioToTime(ratio);
+  const gap = timelineMinGap();
   if (state.timelineDrag === "start") {
-    const maxStart = Math.max(0, resolvedEndTime() - MIN_TIMELINE_GAP);
-    setTimeInputs(els.startMinInput, els.startSecInput, clamp(time, 0, maxStart));
+    const maxStart = isPageMode()
+      ? Math.max(1, resolvedEndTime() - gap)
+      : Math.max(0, resolvedEndTime() - gap);
+    setRangeInputs("start", clamp(value, isPageMode() ? 1 : 0, maxStart));
   } else {
-    const minEnd = Math.min(state.duration, currentStartTime() + MIN_TIMELINE_GAP);
-    setTimeInputs(els.endMinInput, els.endSecInput, clamp(time, minEnd, state.duration));
+    const minEnd = Math.min(total, currentStartTime() + gap);
+    setRangeInputs("end", clamp(value, minEnd, total));
   }
   updateTimeline();
 }
@@ -772,7 +856,12 @@ function applySource(source, mode /* '' | 'restore' | 'fresh' */) {
   state.sourceId = source.id;
   state.cacheKey = !!source.cache_dir;
   state.duration = source.duration || null;
-  state.sourceType = source.type === "image" ? "image" : "video";
+  // PDF 与图片同属“非视频源”：图片只有单张原图；PDF 复用视频的时间轴（按页数）。
+  state.sourceType = (source.type === "image" || source.type === "pdf") ? source.type : "video";
+  const isImage = state.sourceType === "image";
+  const isPdf = state.sourceType === "pdf";
+  state.pageCount = isPdf ? (Number(source.page_count) || null) : null;
+  state.timeUnit = isPdf ? "page" : "sec";
   const metadata = source.metadata || {};
   const title = metadata.display_title || metadata.raw_title || "";
   const channel = metadata.channel || "";
@@ -780,24 +869,57 @@ function applySource(source, mode /* '' | 'restore' | 'fresh' */) {
   // URL 导入自动识别的标题/作者直接分两行放入文本域；本地图片/视频只有标题。
   els.titleArea.value = channel ? `${title}\n${channel}` : title;
 
-  const isImage = state.sourceType === "image";
+  // 时间轴：视频/PDF 显示（PDF 换成页数）；图片源整块隐藏。
   els.timeline.classList.toggle("hidden", isImage);
   els.timeRow.classList.toggle("hidden", isImage);
   els.advancedSettings.classList.toggle("hidden", isImage);
+  const startTimeField = document.getElementById("startTimeField");
+  const endTimeField = document.getElementById("endTimeField");
+  const startPageField = document.getElementById("startPageField");
+  const endPageField = document.getElementById("endPageField");
+  if (startTimeField) startTimeField.hidden = isPdf;
+  if (endTimeField) endTimeField.hidden = isPdf;
+  if (startPageField) startPageField.hidden = !isPdf;
+  if (endPageField) endPageField.hidden = !isPdf;
+  // PDF 专属设置只对 PDF 生效；采样/差异等抽帧参数对 PDF 无意义。
+  if (els.pdfDpiField) els.pdfDpiField.hidden = !isPdf;
+  const sampleField = els.sampleEvery && els.sampleEvery.closest(".field");
+  if (sampleField) sampleField.hidden = isPdf;
+  const diffField = els.diffThreshold && els.diffThreshold.closest(".field");
+  if (diffField) diffField.hidden = isPdf;
+  const bandField = els.bandHalfWidth && els.bandHalfWidth.closest(".field");
+  if (bandField) bandField.hidden = isPdf;
+  const winField = els.compareWindow && els.compareWindow.closest(".field");
+  if (winField) winField.hidden = isPdf;
 
-  els.startMinInput.value = "0";
-  els.startSecInput.value = "0";
-  if (state.duration && state.duration > 0) {
-    setTimeInputs(els.endMinInput, els.endSecInput, state.duration);
+  if (isPdf) {
+    if (els.pdfDpi) {
+      const d = Number(source.pdf_dpi || source.dpi);
+      els.pdfDpi.value = String(Number.isFinite(d) && d > 0 ? d : 200);
+    }
+    if (els.startPageInput) els.startPageInput.value = "1";
+    if (els.endPageInput) els.endPageInput.value = String(state.pageCount || 1);
+    // 与视频「时长中点」一致：PDF 默认显示最中间那一页。
+    state.initialPreviewTime = state.pageCount ? Math.max(1, Math.ceil(state.pageCount / 2)) : 1;
   } else {
-    els.endMinInput.value = "";
-    els.endSecInput.value = "";
+    els.startMinInput.value = "0";
+    els.startSecInput.value = "0";
+    if (state.duration && state.duration > 0) {
+      setTimeInputs(els.endMinInput, els.endSecInput, state.duration);
+    } else {
+      els.endMinInput.value = "";
+      els.endSecInput.value = "";
+    }
+    state.initialPreviewTime = state.duration ? Math.floor(Math.floor(state.duration) / 2) : 0;
   }
-  state.initialPreviewTime = state.duration ? Math.floor(Math.floor(state.duration) / 2) : 0;
 
   // 第2步参数(若随源带回)覆盖以上默认，使“截图前”恢复可回填时间/阈值等
   if (source && source.params2) {
     try { applyStep2Params(source.params2); } catch (e) {}
+  }
+  if (isPdf && source && source.params2 && Number(source.params2.endPage)) {
+    if (els.endPageInput) els.endPageInput.value = String(source.params2.endPage);
+    if (els.startPageInput) els.startPageInput.value = String(source.params2.startPage || 1);
   }
 
   updateCropUi();
@@ -811,6 +933,10 @@ function applySource(source, mode /* '' | 'restore' | 'fresh' */) {
     const targetStage = source.restore.maxStage === 4 ? 4 : 3;
     state.maxStage = Math.max(3, targetStage);
     setStage(targetStage);
+    // 恢复后用户随时可能回到第 2 步：先把默认预览位置定好（视频=时长中点，
+    // PDF=最中间一页），否则回第 2 步时会停在第一页/第 0 秒。
+    state.previewTime = null;
+    state.previewLoading = false;
     setStatus(els.importStatus, "已从缓存恢复。", "success");
     return;
   }
@@ -850,6 +976,29 @@ async function resumePendingCache() {
   applySource(source, "restore");
 }
 
+/**
+ * 缓存已彻底清空后，用「重新 import」把同一个源重新建起来。
+ * 与 B 站分支原本的做法一致，本地文件也复用同一条路：
+ *   - bilibili：用 bvid 重新走下载
+ *   - local / image / pdf：用仍在 els.localFile 里的 File 对象重新上传
+ *     （关键：这里**不要**清空 els.localFile，否则拿不到文件内容）
+ * 拿不到文件内容时（例如从历史记录进来的源）抛错，由调用方回退到第 1 步。
+ */
+async function reimportClearedSource(cache) {
+  if (cache.type === "bilibili" && cache.key) {
+    const fd = new FormData();
+    fd.append("bvid", cache.key);
+    return fetchJson("/api/import", { method: "POST", body: fd });
+  }
+  const file = els.localFile.files && els.localFile.files[0];
+  if (!file) {
+    throw new Error("NO_LOCAL_FILE");
+  }
+  const fd = new FormData();
+  fd.append("file", file, file.name);
+  return fetchJson("/api/import", { method: "POST", body: fd });
+}
+
 async function clearPendingCache() {
   const source = pendingCacheSource;
   pendingCacheSource = null;
@@ -865,32 +1014,35 @@ async function clearPendingCache() {
         body: JSON.stringify({ type: cache.type, key: cache.key, full: true }),
       });
     }
-    // 目录已清空。旧 source 的 video_path/path 指向已被删的文件，不能再沿用。
-    //
-    // B 站：可网络重下 → 重新走一次导入，回到下载中/待截图。
-    // local/图片：原文件被连带删除、无法凭空复原 → 回到第 1 步让用户重新选。
-    if (cache.type === "bilibili" && cache.key) {
-      const fd = new FormData();
-      fd.append("bvid", cache.key);
-      els.cacheModal.classList.add("hidden");
-      const next = await fetchJson("/api/import", { method: "POST", body: fd });
-      applySource(next); // 下载中会走到进度，或重导完成进简介
-      setStatus(els.importStatus, "已清空缓存，正在重新下载该视频…", "success");
+    // 目录已清空。旧 source 的 path/video_path 指向已被删的文件，不能再沿用。
+    // 与 B 站分支保持一致：都走“重新 import”，而不是把用户赶回第 1 步重选。
+    //   bilibili → 用 bvid 重新下载
+    //   本地文件 → 用还在 els.localFile 里的 File 对象重新上传
+    els.cacheModal.classList.add("hidden");
+    try {
+      const next = await reimportClearedSource(cache);
+      // 传 "fresh"：缓存刚被清空，即使返回里还带 has_cache（如占位 state 重新写入
+      // 了 params2），也**不要再弹一次**“恢复/从新开始”，否则会陷入询问循环。
+      applySource(next, "fresh");
+      setStatus(
+        els.importStatus,
+        cache.type === "bilibili" ? "已清空缓存，正在重新下载该视频…" : "已清空缓存，已重新载入该文件。",
+        "success"
+      );
+      return;
+    } catch (err) {
+      if (err && err.message !== "NO_LOCAL_FILE") throw err;
+      // 本地文件内容已不可得（多为从历史记录恢复进来的源）：只能回第 1 步重选。
+      state.sourceId = null;
+      state.images = [];
+      state.captureJobId = null;
+      persistSnapshot = null;
+      state.maxStage = 1;
+      setStage(1);
+      resetExtractionState();
+      setStatus(els.importStatus, "已清空该内容缓存；请重新选择文件导入。", "warning");
       return;
     }
-    // local / image
-    state.sourceId = null;
-    state.images = [];
-    state.captureJobId = null;
-    persistSnapshot = null;
-    state.maxStage = 1;
-    els.cacheModal.classList.add("hidden");
-    els.localFile.value = "";
-    els.bvidInput.value = "";
-    updateFileHint();
-    setStage(1);
-    resetExtractionState();
-    setStatus(els.importStatus, "已清空该内容缓存；请重新选择文件导入。", "warning");
   } catch (error) {
     setStatus(els.importStatus, error.message || "清除缓存失败。", "error");
   } finally {
@@ -913,7 +1065,10 @@ async function loadPreview(timeValue) {
     return;
   }
 
-  const time = Number.isFinite(Number(timeValue)) ? Number(timeValue) : 0;
+  // 视频按秒、PDF 按页：都走 POST /api/preview，只换语义（后端按源类型决定取帧还是渲染页）。
+  const time = Number.isFinite(Number(timeValue))
+    ? Number(timeValue)
+    : (isPageMode() ? 1 : 0);
   const sourceId = state.sourceId;
 
   if (state.previewLoading) {
@@ -1007,7 +1162,7 @@ function updateCleanSummary() {
 }
 
 function buildExtractPayload() {
-  return {
+  const payload = {
     source_id: state.sourceId,
     start: currentStartTime(),
     end: currentEndTime(),
@@ -1020,10 +1175,20 @@ function buildExtractPayload() {
     band_half_width: numericValue(els.bandHalfWidth, 90),
     compare_window: numericValue(els.compareWindow, 1),
   };
+  if (isPageMode()) {
+    // PDF：start/end 是页号（后端按页渲染后取该区间）。
+    payload.start_page = currentStartTime();
+    payload.end_page = currentEndTime();
+    payload.pdf_dpi = numericValue(els.pdfDpi, 200);
+  }
+  return payload;
 }
 
-// 计算本次提取的总帧数（用于进度条）：(结束-开始) / 采样间隔，向上取整。
+// 计算本次提取的总帧数（用于进度条）：(结束-开始) / 采样间隔，向上取整；PDF 用页数。
 function totalFrames() {
+  if (isPageMode()) {
+    return Math.max(0, currentEndTime() - currentStartTime() + 1);
+  }
   const start = currentStartTime();
   const end = currentEndTime();
   const sampleEvery = numericValue(els.sampleEvery, 2);
@@ -1910,9 +2075,10 @@ function toggleHidden(index) {
 function openInsertModal(index) {
   state.insertIndex = index;
   els.insertModal.classList.remove("hidden");
-  // 图片源没有原视频，不显示「从原视频插入」。
-  els.insertDivider.classList.toggle("hidden", state.sourceType === "image");
-  els.insertVideoButton.classList.toggle("hidden", state.sourceType === "image");
+  // 没有“原视频”的源（图片/PDF）不显示「从原视频插入」。
+  const noVideo = hasNoSourceVideo();
+  els.insertDivider.classList.toggle("hidden", noVideo);
+  els.insertVideoButton.classList.toggle("hidden", noVideo);
   els.insertFileInput.value = "";
 }
 
@@ -1948,8 +2114,8 @@ function confirmNoteColor() {
 }
 
 async function insertFromVideo(index) {
-  if (state.sourceType === "image") {
-    showToast("图片源无法从原视频补插", "error");
+  if (hasNoSourceVideo()) {
+    showToast("该源无法从原视频补插", "error");
     return;
   }
   if (state.inserting) return;
@@ -2857,7 +3023,8 @@ els.importForm.addEventListener("submit", async (event) => {
     applySource(source);
     const needPreview = !source.restore && !(source.download && source.download.status === "downloading");
     if (needPreview) {
-      setStatus(els.importStatus, "已导入。", "success");
+      const pages = Number(source.page_count) || 0;
+      setStatus(els.importStatus, source.type === "pdf" && pages ? `已导入 PDF（${pages} 页）。` : "已导入。", "success");
     }
   } catch (error) {
     setStatus(els.importStatus, error.message, "error");
@@ -2871,9 +3038,44 @@ els.startSecInput.addEventListener("change", updateTimeline);
 els.endMinInput.addEventListener("change", updateTimeline);
 els.endSecInput.addEventListener("change", updateTimeline);
 
+/* PDF：页码输入框与 DPI（DPI 变化后预览按新分辨率重渲） */
+(function wirePdfControls() {
+  const onPageInput = () => {
+    if (!isPageMode()) return;
+    // 保持「开始页 ≤ 结束页」，并夹在有效页码内。
+    const total = timelineTotal() || 1;
+    let start = currentStartTime();
+    let end = currentEndTime();
+    if (start > end) {
+      if (document.activeElement === els.startPageInput) end = start;
+      else start = end;
+      if (els.startPageInput) els.startPageInput.value = String(start);
+      if (els.endPageInput) els.endPageInput.value = String(end);
+    }
+    updateTimeline();
+    updatePreviewTimeHint();
+  };
+  ["startPageInput", "endPageInput"].forEach((id) => {
+    const el = document.getElementById(id);
+    if (!el) return;
+    el.addEventListener("input", onPageInput);
+    el.addEventListener("change", () => {
+      onPageInput();
+      loadPreview(currentStartTime());
+      if (typeof persistStep2Params === "function") persistStep2Params();
+    });
+  });
+  if (els.pdfDpi) {
+    els.pdfDpi.addEventListener("change", () => {
+      if (state.sourceType !== "pdf" || !state.sourceId) return;
+      loadPreview(state.previewTime || currentStartTime());
+    });
+  }
+})();
+
 function updateFileHint() {
   const file = els.localFile.files && els.localFile.files[0];
-  els.fileHint.textContent = file ? file.name : "本地视频或图片";
+  els.fileHint.textContent = file ? file.name : "本地视频、图片或 PDF";
 }
 
 els.bvidInput.addEventListener("input", () => {
@@ -2893,8 +3095,8 @@ els.localFile.addEventListener("change", () => {
 
 function isImportableFile(file) {
   if (!file) return false;
-  if (file.type && (file.type.startsWith("video/") || file.type.startsWith("image/"))) return true;
-  return /\.(mp4|mov|mkv|webm|m4s|png|jpe?g|webp|bmp|gif)$/i.test(file.name);
+  if (file.type && (file.type.startsWith("video/") || file.type.startsWith("image/") || file.type === "application/pdf")) return true;
+  return /\.(mp4|mov|mkv|webm|m4s|png|jpe?g|webp|bmp|gif|pdf)$/i.test(file.name);
 }
 
 let fileDragDepth = 0;
@@ -2930,7 +3132,7 @@ els.fileField.addEventListener("drop", (event) => {
 
   const file = Array.from(event.dataTransfer.files).find(isImportableFile);
   if (!file) {
-    setStatus(els.importStatus, "请拖入视频（MP4/MOV/WebM/MKV）或图片（PNG/JPG/WebP/BMP/GIF）。", "error");
+    setStatus(els.importStatus, "请拖入视频（MP4/MOV/WebM/MKV）、图片（PNG/JPG/WebP/BMP/GIF）或 PDF。", "error");
     return;
   }
 
@@ -3616,6 +3818,7 @@ function initResettableControls() {
     { kind: "number", owner: "diffThreshold", els: ["diffThreshold"], default: 0.010 },
     { kind: "number", owner: "bandHalfWidth", els: ["bandHalfWidth"], default: 90 },
     { kind: "number", owner: "compareWindow", els: ["compareWindow"], default: 1 },
+    { kind: "number", owner: "pdfDpi", els: ["pdfDpi"], default: 200 },
     { kind: "slider", owner: "toleranceNum", els: ["toleranceNum", "tolerance"], default: 300 },
     { kind: "slider", owner: "softnessNum", els: ["softnessNum", "softness"], default: 90 },
     { kind: "number", owner: "coeffHorizontal", els: ["coeffHorizontal"], default: 0.7 },
@@ -3940,8 +4143,9 @@ if (historyBackTop) {
 /* ============ 第 2 步截图参数：改动即持久(供“截图前”也能恢复) ============ */
 const STEP2_PARAM_IDS = [
   "startMinInput", "startSecInput", "endMinInput", "endSecInput",
+  "startPageInput", "endPageInput",
   "sampleEvery", "diffThreshold", "bandHalfWidth", "compareWindow",
-  "tolerance", "softness",
+  "tolerance", "softness", "pdfDpi",
 ];
 
 function collectStep2Params() {
@@ -3964,6 +4168,10 @@ function collectStep2Params() {
   o.compare_window = num("compareWindow", 1);
   o.tolerance = num("tolerance", 300);
   o.softness = num("softness", 90);
+  o.pdf_dpi = num("pdfDpi", 200);
+  // PDF 页码范围（视频源不用；存下来便于恢复第 2 步进度）
+  o.startPage = num("startPageInput", 1);
+  o.endPage = num("endPageInput", null);
   // 抽帧前裁剪框归一化比率
   o.cropStart = (state && typeof state.cropStart==="number") ? state.cropStart : 0;
   o.cropEnd = (state && typeof state.cropEnd==="number") ? state.cropEnd : 1;
@@ -3991,6 +4199,10 @@ function applyStep2Params(params) {
   set("compareWindow", params.compare_window);
   set("tolerance", params.tolerance);
   set("softness", params.softness);
+  set("pdfDpi", params.pdf_dpi);
+  // PDF 页码范围
+  if (params.startPage != null) set("startPageInput", Math.max(1, Math.round(params.startPage)));
+  if (params.endPage != null) set("endPageInput", Math.max(1, Math.round(params.endPage)));
   // 抽帧前裁剪框
   const numOr=(v,d)=>(
     v == null || !Number.isFinite(Number(v)) ? d : Number(v)
