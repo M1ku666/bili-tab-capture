@@ -3,7 +3,12 @@ setlocal
 chcp 65001 >nul
 cd /d "%~dp0"
 
+REM NOTE: keep this file ASCII-only. Mixing CJK comments into a .bat can be
+REM mis-parsed by cmd.exe before/around chcp takes effect. Chinese docs live in
+REM build_mac.sh and build_preflight.py instead.
+
 set "PY=.venv\Scripts\python.exe"
+set "REQ=requirements.txt"
 
 if not exist "%PY%" (
     echo [ERROR] Virtualenv not found: %PY%
@@ -13,10 +18,24 @@ if not exist "%PY%" (
     exit /b 1
 )
 
-echo [1/3] Installing / upgrading PyInstaller ...
+echo [1/5] Installing runtime dependencies from %REQ% ...
+REM This step used to be missing: only PyInstaller was installed, so a package
+REM added later (e.g. pymupdf) stayed absent from the venv -- the build still
+REM succeeded, but the produced exe failed at runtime with "missing library".
+"%PY%" -m pip install --upgrade -r "%REQ%" || goto :error
+
+echo [2/5] Installing / upgrading PyInstaller ...
 "%PY%" -m pip install --upgrade pyinstaller || goto :error
 
-echo [2/3] Building single-file exe ...
+echo [3/5] Verifying that key dependencies can be imported ...
+REM Fail fast (with a precise list) instead of shipping an exe that cannot
+REM import its own dependencies.
+"%PY%" build_preflight.py || goto :error
+
+echo [4/5] Building single-file exe ...
+REM pymupdf ships no PyInstaller hook and carries native libraries
+REM (_mupdf / libmupdf*). --collect-submodules alone would drop those binaries,
+REM so --collect-all is required; fitz is its legacy alias module.
 "%PY%" -m PyInstaller --noconfirm --clean --onefile --name BiliTabCapture ^
     --add-data "templates;templates" ^
     --add-data "static;static" ^
@@ -25,9 +44,11 @@ echo [2/3] Building single-file exe ...
     --collect-submodules "curl_cffi" ^
     --collect-submodules "qrcode" ^
     --hidden-import "qrcode" ^
+    --collect-all "pymupdf" ^
+    --collect-all "fitz" ^
     app.py || goto :error
 
-echo [3/3] Done.
+echo [5/5] Done.
 echo.
 echo Output : %~dp0dist\BiliTabCapture.exe
 echo Usage  : copy BiliTabCapture.exe to any Windows PC and double-click it.

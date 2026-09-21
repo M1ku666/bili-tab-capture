@@ -33,9 +33,33 @@ def _import_fitz():
         import fitz  # PyMuPDF 旧模块名
         return fitz
     except Exception as exc:  # pragma: no cover - 依赖缺失时的提示
-        raise PdfRenderError(
-            "缺少 PDF 支持库 PyMuPDF，请先执行：pip install pymupdf"
-        ) from exc
+        raise PdfRenderError(_missing_dependency_hint(exc)) from exc
+
+
+def _missing_dependency_hint(exc: BaseException) -> str:
+    """按运行方式给出**可执行**的提示。
+
+    打包后的 exe 里根本没法 pip install，此时应引导用户重新打包/换包，
+    而不是让用户对着“pip install pymupdf”干瞪眼。
+    """
+    try:
+        from runtime_paths import is_frozen
+
+        frozen = is_frozen()
+    except Exception:
+        frozen = bool(getattr(__import__("sys"), "frozen", False))
+
+    detail = f"（{type(exc).__name__}: {exc}）"
+    if frozen:
+        return (
+            "当前程序缺少 PDF 支持库 PyMuPDF" + detail + "。"
+            "这是打包时漏收了该依赖，请用更新后的 build_exe.bat / build_mac.sh 重新打包"
+            "（脚本会自动安装依赖并完整收集 pymupdf）。"
+        )
+    return (
+        "缺少 PDF 支持库 PyMuPDF" + detail + "。"
+        "请先执行：pip install -r requirements.txt"
+    )
 
 
 def clamp_dpi(value: Any, default: int = PDF_DPI_DEFAULT) -> int:
