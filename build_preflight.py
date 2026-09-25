@@ -25,6 +25,7 @@ REQUIRED_MODULES = [
     ("curl_cffi", "curl_cffi"),
     ("qrcode", "qrcode"),
     ("pymupdf", "pymupdf"),  # PDF 渲染（导入名与发行名一致）
+    ("certifi", "certifi"),  # HTTPS CA bundle（缺失会导致更新检查报证书校验失败）
 ]
 
 

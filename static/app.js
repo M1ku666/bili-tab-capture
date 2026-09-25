@@ -3527,7 +3527,11 @@ async function checkForUpdate() {
     const data = await fetchJson("/api/latest_version");
     const latest = data && data.version;
     console.log("[update] latest", latest, "releases", (data && data.releases || []).length);
-    if (!latest) return;
+    if (!latest) {
+      // 后端把失败原因放在 detail 里（例如 TLS 证书校验失败），否则这里只会"静默没反应"。
+      if (data && data.detail) console.warn("[update] 服务端获取版本失败:", data.detail);
+      return;
+    }
     state.latestVersion = latest;
     const isNewer = compareVersions(latest, APP_VERSION) > 0;
     if (!isNewer) return;

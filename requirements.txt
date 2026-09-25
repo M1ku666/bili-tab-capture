@@ -5,3 +5,4 @@ Pillow
 curl_cffi
 qrcode
 pymupdf
+certifi

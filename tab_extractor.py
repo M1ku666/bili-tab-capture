@@ -36,6 +36,7 @@ HEADER_LINE_HEIGHT_RATIO = 1.2  # 标题/作者行高 = 字号 × 该比例（�
 # --- Bilibili support -----------------------------------------------------
 
 import bili
+import net_tls
 
 VIDEO_FILE_EXTENSIONS = (".mp4", ".mkv", ".webm", ".mov", ".m4s")
 BILIBILI_USER_AGENT = (
@@ -46,7 +47,13 @@ _BILIBILI_BV_RE = re.compile(r"BV[0-9A-Za-z]{10}")
 _BILIBILI_AV_RE = re.compile(r"\bav(\d+)\b", re.IGNORECASE)
 
 # Bilibili is reachable directly; skip any system proxy so the API responds correctly.
-_NO_PROXY_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+# 必须挂上 net_tls 的 HTTPSHandler：默认 HTTPSHandler 用标准库 CA 路径，macOS/Homebrew
+# 或打包环境下缺中间证书会报 CERTIFICATE_VERIFY_FAILED（输入 BV 号后立即触发）。
+_np_handlers = [urllib.request.ProxyHandler({})]
+_np_tls_context = net_tls.ssl_context()
+if _np_tls_context is not None:
+    _np_handlers.append(urllib.request.HTTPSHandler(context=_np_tls_context))
+_NO_PROXY_OPENER = urllib.request.build_opener(*_np_handlers)
 
 
 @dataclass

@@ -2445,12 +2445,16 @@ def api_latest_version():
     """服务端获取最新 release 版本(首选 Gitee，拉不到再试 GitHub)，避免浏览器403/CORS。"""
     import urllib.request as _ul, re as _re
 
+    import net_tls
+
     UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/124.0 Safari/537.36"
 
     def _pull(url, kind):
         req = _ul.Request(url, headers={"User-Agent": UA, "Accept": "application/json"})
         out = []
-        with _ul.urlopen(req, timeout=8) as resp:
+        # 用 net_tls.urlopen：系统 CA 缺中间证书时会自动换 certifi 等候选，
+        # 避免 macOS/打包环境下报 CERTIFICATE_VERIFY_FAILED。
+        with net_tls.urlopen(req, timeout=8) as resp:
             data = json.loads(resp.read().decode("utf-8", "replace"))
         if not isinstance(data, list):
             return None
@@ -2482,20 +2486,27 @@ def api_latest_version():
         return jsonify({"version": top[1], "source": kind if top[1] else None, "releases": releases})
 
     # 1) Gitee tags API
+    errors = []
     try:
         api = _pull("https://gitee.com/api/v5/repos/m1ku666/bili-tab-capture/tags?", "gitee")
         if api:
             return _answer("gitee", api)
-    except Exception:
+    except Exception as exc:
+        errors.append(f"gitee: {type(exc).__name__}: {exc}")
         api = None
     # 2) GitHub releases 兜底
     try:
         gh = _pull("https://api.github.com/repos/m1ku666/bili-tab-capture/releases?per_page=30", "github")
         if gh:
             return _answer("github", gh)
-    except Exception:
-        pass
-    return jsonify({"version": None, "source": None, "releases": []})
+    except Exception as exc:
+        errors.append(f"github: {type(exc).__name__}: {exc}")
+
+    # 两个源都失败：把原因回给前端并留日志，否则这类 TLS/网络问题只能看到"检查更新没反应"。
+    detail = "；".join(errors)
+    if detail:
+        print(f"[更新检查] 获取版本失败（{detail}）")
+    return jsonify({"version": None, "source": None, "releases": [], "detail": detail or None})
 
 
 @app.get("/api/previews/<path:filename>")
