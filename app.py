@@ -2525,8 +2525,22 @@ def merge_image():
         bottom_path = crops_dir / payload.get("bottom", "")
         if not top_path.exists() or not bottom_path.exists():
             return json_error("未知的截图。", 404)
-        top_img = Image.open(top_path).convert("RGB")
-        bottom_img = Image.open(bottom_path).convert("RGB")
+        def cropped_image(path: Path, crop: Dict[str, Any]) -> Image.Image:
+            with Image.open(path) as source:
+                image = source.convert("RGB")
+            width, height = image.size
+            left = max(0.0, min(1.0, float(crop.get("l", 0.0))))
+            right = max(left, min(1.0, float(crop.get("r", 1.0))))
+            top = max(0.0, min(1.0, float(crop.get("t", 0.0))))
+            bottom = max(top, min(1.0, float(crop.get("b", 1.0))))
+            box = (round(width * left), round(height * top),
+                   round(width * right), round(height * bottom))
+            if box[2] <= box[0] or box[3] <= box[1]:
+                raise ValueError("裁剪区域过小，无法合并。")
+            return image.crop(box)
+
+        top_img = cropped_image(top_path, payload.get("top_crop") or {})
+        bottom_img = cropped_image(bottom_path, payload.get("bottom_crop") or {})
         tw, th = top_img.size
         bw, bh = bottom_img.size
         w = max(tw, bw)

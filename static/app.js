@@ -2550,8 +2550,10 @@ async function splitCard(index, splitBtn, event) {
 /* 高度不足时：合并到上方（与上一张截图纵向拼接成一张）。 */
 async function mergeCardUpward(index) {
   const m = state.images[index];
-  const above = state.images[index - 1];
-  if (!m || !above) {
+  let aboveIndex = index - 1;
+  while (aboveIndex >= 0 && state.images[aboveIndex].hidden) aboveIndex -= 1;
+  const above = state.images[aboveIndex];
+  if (!m || m.hidden || !above) {
     showToast("没有上方图片可合并", "error");
     return;
   }
@@ -2560,7 +2562,7 @@ async function mergeCardUpward(index) {
     const data = await fetchJson("/api/merge_image", {
       method: "POST",
       headers: JSON_HEADERS,
-      body: JSON.stringify({ job_id: state.captureJobId, top: above.file, bottom: m.file }),
+      body: JSON.stringify({ job_id: state.captureJobId, top: above.file, bottom: m.file, top_crop: above.crop, bottom_crop: m.crop }),
     });
     const merged = {
       file: data.file,
@@ -2573,7 +2575,8 @@ async function mergeCardUpward(index) {
       crop: { l: 0, r: 1, t: 0, b: 1 },
       measures: [],
     };
-    state.images.splice(index - 1, 2, merged);
+    state.images.splice(index, 1);
+    state.images.splice(aboveIndex, 1, merged);
     await detectMeasuresFor([data.file]);
     renderCardList();
     pending.resolve("已合并到上方", "success");
@@ -2585,8 +2588,10 @@ async function mergeCardUpward(index) {
 /* 高度不足时：合并到下方（与下一张截图纵向拼接成一张）。 */
 async function mergeCardDownward(index) {
   const m = state.images[index];
-  const below = state.images[index + 1];
-  if (!m || !below) {
+  let belowIndex = index + 1;
+  while (belowIndex < state.images.length && state.images[belowIndex].hidden) belowIndex += 1;
+  const below = state.images[belowIndex];
+  if (!m || m.hidden || !below) {
     showToast("没有下方图片可合并", "error");
     return;
   }
@@ -2595,7 +2600,7 @@ async function mergeCardDownward(index) {
     const data = await fetchJson("/api/merge_image", {
       method: "POST",
       headers: JSON_HEADERS,
-      body: JSON.stringify({ job_id: state.captureJobId, top: m.file, bottom: below.file }),
+      body: JSON.stringify({ job_id: state.captureJobId, top: m.file, bottom: below.file, top_crop: m.crop, bottom_crop: below.crop }),
     });
     const merged = {
       file: data.file,
@@ -2608,7 +2613,8 @@ async function mergeCardDownward(index) {
       crop: { l: 0, r: 1, t: 0, b: 1 },
       measures: [],
     };
-    state.images.splice(index, 2, merged);
+    state.images.splice(belowIndex, 1);
+    state.images.splice(index, 1, merged);
     await detectMeasuresFor([data.file]);
     renderCardList();
     pending.resolve("已合并到下方", "success");
