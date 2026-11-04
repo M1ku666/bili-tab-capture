@@ -1,8 +1,8 @@
 # BiliTabCapture
 
-将本地或哔哩哔哩的动态谱视频转换为PDF文件
+将本地、哔哩哔哩或 YouTube 的动态谱视频转换为PDF文件
 
-相比[TabCapture](https://github.com/santiRostan/TabCapture)新增更多功能，移除Youtube视频下载功能
+相比[TabCapture](https://github.com/santiRostan/TabCapture)新增更多功能
 
 ## 新增功能
 
@@ -10,6 +10,7 @@
 - 方便地拖拽上传本地文件
 - 通过哔哩哔哩BV号导入视频
 - 登录哔哩哔哩账号获取更高分辨率视频
+- 通过 YouTube 链接导入视频（基于 [yt-dlp](https://github.com/yt-dlp/yt-dlp)，最高 1080p，无需 ffmpeg）
 - 谱面背景为彩色的视频
 - 全屏动态谱视频
 - 不同段落的谱面高度不一致的视频
@@ -54,6 +55,14 @@ pip install -r requirements.txt
 ```bash
 python app.py
 ```
+
+## YouTube 说明
+
+- 在导入框粘贴 YouTube 链接即可（支持 `watch?v=`、`youtu.be/`、`shorts/` 等格式，或 11 位视频 ID）。
+- 只下载单条视频轨（优先 H.264 mp4）和一条 m4a 音轨（导出 `.psz` 时作为伴奏），不需要安装 ffmpeg。
+- 若提示 “Sign in to confirm you're not a bot”，可将浏览器导出的 Netscape 格式 cookies 保存为程序目录下的 `youtube_cookies.txt` 后重试。
+- YouTube 经常调整接口，下载失败时请先升级 yt-dlp：`pip install -U yt-dlp`。新版 yt-dlp 可能还需要安装 JS 运行时（如 [deno](https://deno.com)），详见 yt-dlp 文档。
+- 命令行同样支持：`python tab_extractor.py "https://youtu.be/VIDEO_ID" --output out.pdf`
 
 ## 打包
 

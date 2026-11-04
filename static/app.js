@@ -13,7 +13,7 @@ const state = {
   importing: false,
   downloading: false,
   downloadPollTimer: null,
-  cacheKey: false, // source 是否有可持久化的缓存目录（bilibili / local）
+  cacheKey: false, // source 是否有可持久化的缓存目录（bilibili / youtube / local）
   previewLoading: false,
   previewRequestId: 0,
   previewTime: null,
@@ -942,7 +942,7 @@ function applySource(source, mode /* '' | 'restore' | 'fresh' */) {
     return;
   }
 
-  // B 站视频在导入时即开始下载：停留在导入页显示进度，下载完成后再进入截图页。
+  // B 站 / YouTube 视频在导入时即开始下载：停留在导入页显示进度，下载完成后再进入截图页。
   if (source.download && source.download.status === "downloading") {
     state.maxStage = 1;
     setStage(1);
@@ -986,9 +986,9 @@ async function resumePendingCache() {
  * 拿不到文件内容时（例如从历史记录进来的源）抛错，由调用方回退到第 1 步。
  */
 async function reimportClearedSource(cache) {
-  if (cache.type === "bilibili" && cache.key) {
+  if ((cache.type === "bilibili" || cache.type === "youtube") && cache.key) {
     const fd = new FormData();
-    fd.append("bvid", cache.key);
+    fd.append("bvid", cache.type === "youtube" ? `https://www.youtube.com/watch?v=${cache.key}` : cache.key);
     return fetchJson("/api/import", { method: "POST", body: fd });
   }
   const file = els.localFile.files && els.localFile.files[0];
@@ -1027,7 +1027,7 @@ async function clearPendingCache() {
       applySource(next, "fresh");
       setStatus(
         els.importStatus,
-        cache.type === "bilibili" ? "已清空缓存，正在重新下载该视频…" : "已清空缓存，已重新载入该文件。",
+        (cache.type === "bilibili" || cache.type === "youtube") ? "已清空缓存，正在重新下载该视频…" : "已清空缓存，已重新载入该文件。",
         "success"
       );
       return;

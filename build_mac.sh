@@ -53,6 +53,7 @@ mkdir -p build/.pyinstaller
     --collect-submodules "cv2" \
     --collect-submodules "curl_cffi" \
     --collect-submodules "qrcode" \
+    --collect-submodules "yt_dlp" \
     --hidden-import "qrcode" \
     --collect-all "pymupdf" \
     --collect-all "fitz" \

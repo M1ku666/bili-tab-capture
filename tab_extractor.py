@@ -37,6 +37,7 @@ HEADER_LINE_HEIGHT_RATIO = 1.2  # 标题/作者行高 = 字号 × 该比例（�
 
 import bili
 import net_tls
+import youtube
 
 VIDEO_FILE_EXTENSIONS = (".mp4", ".mkv", ".webm", ".mov", ".m4s")
 
@@ -246,6 +247,34 @@ def probe_bilibili_metadata(url: str) -> Tuple[VideoMetadata, Optional[float]]:
         source_url=canonical,
     )
     return metadata, duration_float
+
+
+# --- YouTube support ------------------------------------------------------
+
+def is_youtube_source(value: str) -> bool:
+    """YouTube 链接或裸视频 ID。下载/解析见 `youtube.py`（yt-dlp 延迟导入）。"""
+    return youtube.looks_like_youtube(value)
+
+
+def probe_youtube_metadata(url: str) -> Tuple[VideoMetadata, Optional[float]]:
+    """Fetch title, channel and duration for a YouTube video (no download)."""
+    info = youtube.probe_metadata(url)
+    metadata = build_video_metadata(
+        raw_title=info.get("title"),
+        channel=info.get("channel"),
+        source_url=info.get("url"),
+    )
+    return metadata, info.get("duration")
+
+
+def download_youtube_video(
+    url: str,
+    output_dir: Path,
+    max_height: int = youtube.DEFAULT_MAX_HEIGHT,
+    with_audio: bool = False,
+) -> Path:
+    """下载 YouTube 视频（单条视频轨，不需要 ffmpeg）；`with_audio` 另下 `audio.m4a`。"""
+    return youtube.download_video(url, output_dir, max_height=max_height, with_audio=with_audio)
 
 
 def find_video_file(directory: Path) -> Optional[Path]:
@@ -2053,7 +2082,7 @@ def main():
 
     parser.add_argument(
         "source",
-        help="Bilibili URL（BV/av 号）或 ruta a archivo de video local",
+        help="Bilibili URL（BV/av 号）、YouTube 链接，或本地视频文件路径",
     )
 
     parser.add_argument(
@@ -2235,7 +2264,19 @@ def main():
         crops_dir = tmp_path / "crops"
         comparison_dir = tmp_path / "comparison" if args.keep_comparison_images else None
 
-        if source.startswith("http://") or source.startswith("https://"):
+        if is_youtube_source(source):
+            print("正在下载 YouTube 视频...")
+            video_path = download_youtube_video(source, tmp_path)
+            _meta, _duration = probe_youtube_metadata(source)
+            metadata = build_video_metadata(
+                raw_title=_meta.raw_title,
+                channel=_meta.channel,
+                source_url=_meta.source_url,
+                title_override=args.title,
+                channel_override=args.channel,
+            )
+            downloaded_start_sec = 0.0
+        elif source.startswith("http://") or source.startswith("https://"):
             print("正在下载 Bilibili 视频...")
             video_path = download_bilibili_video(source, tmp_path)
             _meta, _duration = probe_bilibili_metadata(source)

@@ -43,6 +43,7 @@ REM so --collect-all is required; fitz is its legacy alias module.
     --collect-submodules "cv2" ^
     --collect-submodules "curl_cffi" ^
     --collect-submodules "qrcode" ^
+    --collect-submodules "yt_dlp" ^
     --hidden-import "qrcode" ^
     --collect-all "pymupdf" ^
     --collect-all "fitz" ^

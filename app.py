@@ -34,6 +34,7 @@ from tab_extractor import (
     compute_stitch_seams,
     detect_measure_barlines,
     download_bilibili_video,
+    download_youtube_video,
     extract_bilibili_id,
     extract_note_mask,
     extract_unique_crops,
@@ -44,12 +45,15 @@ from tab_extractor import (
     normalize_bilibili_url,
     preprocess_for_detection,
     probe_bilibili_metadata,
+    probe_youtube_metadata,
     save_video_frame,
     split_into_measures,
     validate_crop_ratios,
     validate_crop_x_ratios,
 )
 
+
+import youtube
 
 ROOT_DIR = data_dir()
 CACHE_DIR = ROOT_DIR / "BiliTabCapture_cache"
@@ -69,6 +73,21 @@ def hash_file(path: Path, chunk_size: int = 1 << 20) -> str:
 
 def bilibili_cache_dir(bvid: str) -> Path:
     return CACHE_DIR / "bv" / bvid
+
+
+def youtube_cache_dir(video_id: str) -> Path:
+    return CACHE_DIR / "yt" / video_id
+
+
+# 需要先下载再抽帧的远程视频源。凡是判断“远程视频”都用这个集合，不要写死 == "bilibili"。
+REMOTE_VIDEO_TYPES = {"bilibili", "youtube"}
+
+
+def download_remote_video(source: Dict[str, Any], output_dir: Path, with_audio: bool = True) -> Path:
+    """按源类型下载远程视频到 output_dir（B 站走 bili，YouTube 走 yt-dlp）。"""
+    if source["type"] == "youtube":
+        return download_youtube_video(source["url"], output_dir, with_audio=with_audio)
+    return download_bilibili_video(source["url"], output_dir, with_audio=with_audio)
 
 
 def local_cache_dir(file_hash: str) -> Path:
@@ -93,7 +112,7 @@ def _cache_clearable(cache_dir: Path) -> bool:
         rel = cache_dir.relative_to(root)
     except (OSError, ValueError):
         return False
-    return rel.parts and rel.parts[0] in {"bv", "local", "img", "pdf"}
+    return rel.parts and rel.parts[0] in {"bv", "yt", "local", "img", "pdf"}
 
 
 def has_restorable_cache(cache_dir: Path, state: Optional[Dict[str, Any]] = None) -> bool:
@@ -480,6 +499,8 @@ def cached_remote_preview_video(source: Dict[str, Any]) -> Path:
 
     if source["type"] == "bilibili":
         return download_bilibili_video(source["url"], preview_dir, quality=16)
+    if source["type"] == "youtube":
+        return download_youtube_video(source["url"], preview_dir, max_height=360)
 
     raise RuntimeError(f"不支持的远程源类型：{source.get('type')}")
 
@@ -543,11 +564,11 @@ def run_capture_job(job_id: str, payload: Dict[str, Any]) -> None:
             update_job(job_id, status="running", phase="downloading", updated_at=time.time())
 
             source_metadata = metadata_from_dict(source["metadata"])
-            if source["type"] == "bilibili":
+            if source["type"] in REMOTE_VIDEO_TYPES:
                 video_path = Path(source.get("video_path") or "")
                 if not video_path.exists():
-                    print("正在下载 Bilibili 视频...")
-                    video_path = download_bilibili_video(source["url"], download_dir, with_audio=True)
+                    print("正在下载 %s 视频..." % ("YouTube" if source["type"] == "youtube" else "Bilibili"))
+                    video_path = download_remote_video(source, download_dir, with_audio=True)
                 downloaded_start_sec = 0.0
                 metadata = build_video_metadata(
                     raw_title=source_metadata.raw_title,
@@ -873,6 +894,22 @@ def run_bilibili_download(source_id: str, url: str, cache_dir: Path, bvid: str) 
                 src["download"] = {"status": "error", "message": str(exc)}
 
 
+def run_youtube_download(source_id: str, url: str, cache_dir: Path) -> None:
+    """Background YouTube download started at import time（落盘名 = `<video_id>.<ext>`）。"""
+    try:
+        path = download_youtube_video(url, cache_dir, with_audio=True)
+        with STORE_LOCK:
+            src = SOURCES.get(source_id)
+            if src:
+                src["video_path"] = str(path)
+                src["download"] = {"status": "done", "message": None}
+    except Exception as exc:
+        with STORE_LOCK:
+            src = SOURCES.get(source_id)
+            if src:
+                src["download"] = {"status": "error", "message": str(exc)}
+
+
 def make_cached_job(source_id: str, cache_dir: Path, state: Dict[str, Any]) -> str:
     """Create a done job from persisted cache state; returns the job_id."""
     job_id = uuid.uuid4().hex
@@ -942,6 +979,57 @@ def safe_upload_name(raw_name: str, suffix: str) -> str:
     return cleaned
 
 
+def import_youtube(value: str):
+    """导入 YouTube 视频：与 B 站分支同一套流程（占位 state → 命中缓存弹窗 / 后台下载）。"""
+    video_id = youtube.extract_video_id(value)
+    if not video_id:
+        raise ValueError("无法识别该 YouTube 链接。")
+    full_url = youtube.canonical_url(video_id)
+    metadata, duration = probe_youtube_metadata(full_url)
+    source_id = uuid.uuid4().hex
+    cache_dir = youtube_cache_dir(video_id)
+    ensure_placeholder_state(cache_dir, metadata_to_dict(metadata))
+    source = {
+        "id": source_id,
+        "type": "youtube",
+        "url": full_url,
+        "metadata": metadata_to_dict(metadata),
+        "duration": duration,
+        "cache_dir": str(cache_dir),
+        "download": {"status": "idle", "message": None},
+    }
+    state = load_state_json(cache_dir)
+    cached_video = find_video_file(cache_dir)
+    has_img = _has_images(cache_dir, state)
+    has_par = _has_params(state)
+    if has_img or has_par:
+        source["has_cache"] = True
+        source["cache"] = {"cache_dir": str(cache_dir), "type": "youtube", "key": video_id,
+                           "title": metadata.display_title or metadata.raw_title}
+        source["params2"] = read_capture_prefs(state)
+        if cached_video is not None:
+            source["download"]["status"] = "done"
+            source["video_path"] = str(cached_video)
+        if has_img:
+            job_id = make_cached_job(source_id, cache_dir, state)
+            source["restore"] = {"job_id": job_id, "images": restore_images(state),
+                                 "layout": state.get("layout"), "maxStage": state.get("maxStage")}
+            source["download"]["status"] = "done"
+    elif cached_video is not None:
+        source["video_path"] = str(cached_video)
+        source["download"]["status"] = "done"
+    else:
+        source["download"]["status"] = "downloading"
+        threading.Thread(
+            target=run_youtube_download,
+            args=(source_id, full_url, cache_dir),
+            daemon=True,
+        ).start()
+    with STORE_LOCK:
+        SOURCES[source_id] = source
+    return jsonify(source)
+
+
 @app.post("/api/import")
 def import_source():
     ensure_cache_dirs()
@@ -949,6 +1037,10 @@ def import_source():
     upload = request.files.get("file")
 
     try:
+        if bvid and youtube.looks_like_youtube(bvid) and (
+            youtube.is_youtube_url(bvid) or extract_bilibili_id(bvid) == (None, None)
+        ):
+            return import_youtube(bvid)
         if bvid:
             full_url = normalize_bilibili_url(bvid)
             metadata, duration = probe_bilibili_metadata(full_url)
@@ -1213,12 +1305,14 @@ def cache_clear():
 # --------------------------------------------------------------------------
 _CACHE_KIND_DIR = {
     "bilibili": "bv",
+    "youtube": "yt",
     "image": "img",
     "local": "local",
     "pdf": "pdf",
 }
 _CACHE_DIR_BY_KIND = {
     "bilibili": bilibili_cache_dir,
+    "youtube": youtube_cache_dir,
     "image": image_cache_dir,
     "local": local_cache_dir,
     "pdf": pdf_cache_dir,
@@ -1346,7 +1440,7 @@ def _history_entries():
             meta = (state or {}).get("metadata") or {}
             title = _entry_title(state) or key
             chnl = meta.get("channel") or ""
-            kind_label = {"bilibili": "B站视频", "image": "图片", "local": "本地视频", "pdf": "PDF"}.get(kind, kind)
+            kind_label = {"bilibili": "B站视频", "youtube": "YouTube", "image": "图片", "local": "本地视频", "pdf": "PDF"}.get(kind, kind)
             mg = (state or {}).get("maxStage") if state else None
 
             def _playable(directory: Path, exts=(".mp4", ".mkv", ".webm", ".mov", ".m4s", ".m4s")):
@@ -1356,7 +1450,7 @@ def _history_entries():
                 return None
 
             resumable = False
-            if kind in ("local", "bilibili"):
+            if kind in ("local", "bilibili", "youtube"):
                 # 能提供可播放文件即可继续(无论是否有截图 state)
                 resumable = bool(_playable(cd)) or bool(state and state.get("captures"))
             elif kind == "image":
@@ -1422,6 +1516,24 @@ def _bilibili_real_cover(key: str) -> Optional[bytes]:
     return None
 
 
+_YT_COVER_CACHE = {}       # video_id -> (ts, bytes)
+
+
+def _youtube_real_cover(video_id: str) -> Optional[bytes]:
+    """YouTube 视频封面（i.ytimg.com hqdefault），短 TTL 内存缓存。失败返回 None。"""
+    import time as _t
+    now = _t.time()
+    cached = _YT_COVER_CACHE.get(video_id)
+    if cached and now - cached[0] < _BILI_COVER_TTL:
+        return cached[1]
+    data = youtube.fetch_thumbnail(video_id)
+    if data:
+        _YT_COVER_CACHE[video_id] = (now, data)
+        if len(_YT_COVER_CACHE) > 200:
+            _YT_COVER_CACHE.clear()
+    return data
+
+
 @app.get("/api/history/cover")
 def api_history_cover():
     kind = request.args.get("kind") or ""
@@ -1436,6 +1548,11 @@ def api_history_cover():
     # B 站用真实封面(pic)优先；失败或非 bilibili 退回本地首帧。
     if kind == "bilibili":
         real = _bilibili_real_cover(safe_key)
+        if real:
+            from flask import Response
+            return Response(real, mimetype="image/jpeg")
+    if kind == "youtube":
+        real = _youtube_real_cover(safe_key)
         if real:
             from flask import Response
             return Response(real, mimetype="image/jpeg")
@@ -1500,16 +1617,17 @@ def api_history_restore():
     meta = (state or {}).get("metadata") or {}
 
     source_id = uuid.uuid4().hex
-    if kind == "bilibili":
-        fid = next((p for p in cache_dir.iterdir()
-                    if p.is_file() and p.name.lower().endswith((".mp4", ".mkv", ".webm", ".mov", ".m4s"))), None)
+    if kind in REMOTE_VIDEO_TYPES:
+        fid = find_video_file(cache_dir)
         try:
             dl = get_video_duration(fid) if fid is not None else None
         except Exception:
             dl = None
+        default_url = (youtube.canonical_url(safe_key) if kind == "youtube"
+                       else f"https://www.bilibili.com/video/{safe_key}")
         source = {
-            "id": source_id, "type": "bilibili",
-            "url": meta.get("source_url") or f"https://www.bilibili.com/video/{safe_key}",
+            "id": source_id, "type": kind,
+            "url": meta.get("source_url") or default_url,
             "metadata": meta,
             "duration": dl,
             "cache_dir": str(cache_dir),
@@ -1737,14 +1855,14 @@ def preview_source():
         preview_path = PREVIEWS_DIR / preview_name
 
         resp_quality = None
-        if source["type"] == "bilibili":
+        if source["type"] in REMOTE_VIDEO_TYPES:
             cached = Path(source.get("video_path") or "")
             base_dir = Path(source.get("cache_dir")) if source.get("cache_dir") else cached.parent
             if cached.exists():
                 video_path = cached
             else:
                 # 预览也用“最终下载的同一清晰度”：缓存目录下载整份（非 low 预览副本）
-                video_path = download_bilibili_video(source["url"], base_dir, with_audio=True)
+                video_path = download_remote_video(source, base_dir, with_audio=True)
                 source["video_path"] = str(video_path)
             save_video_frame(video_path, preview_path, time_sec=time_sec)
             # 诚实清晰度：优先 .dlqh(实测像素高度)；否则退 .dlqn(请求档位)
@@ -1980,9 +2098,9 @@ _AUDIO_MIME = {
 def _source_audio_path(job: Dict[str, Any], source: Dict[str, Any]) -> Optional[Path]:
     """这次导出能用的音轨：导入 B 站视频时跟着下下来的 `audio.m4a`（没有就 None）。
 
-    只有 B 站源会有 —— 本地视频的音视频混在一个文件里，不引 ffmpeg 拆不出来。
+    只有 B 站 / YouTube 源会有 —— 本地视频的音视频混在一个文件里，不引 ffmpeg 拆不出来。
     """
-    if source.get("type") != "bilibili":
+    if source.get("type") not in REMOTE_VIDEO_TYPES:
         return None
     candidates = [source.get("cache_dir"), job.get("cache_dir")]
     video_path = source.get("video_path")
@@ -2028,6 +2146,10 @@ def _source_cover(source: Dict[str, Any]) -> Optional[tuple]:
     复用历史记录那条 `/api/history/cover` 已经在用的 `_bilibili_real_cover`（自带短 TTL 缓存），
     所以列表里看过的封面不会为导出再拉一次。
     """
+    if source.get("type") == "youtube":
+        video_id = youtube.extract_video_id(source.get("url") or "")
+        data = _youtube_real_cover(video_id) if video_id else None
+        return (f"cover.{_image_ext_from_bytes(data)}", data) if data else None
     if source.get("type") != "bilibili":
         return None
     cache_dir = source.get("cache_dir")

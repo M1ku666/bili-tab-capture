@@ -26,3 +26,5 @@ BiliTabCapture_cache/
 build/
 dist/
 *.spec
+# YouTube cookies（用户自行导出，含登录凭证）
+youtube_cookies.txt

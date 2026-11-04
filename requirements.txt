@@ -6,3 +6,4 @@ curl_cffi
 qrcode
 pymupdf
 certifi
+yt-dlp
