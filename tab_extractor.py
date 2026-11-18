@@ -51,7 +51,10 @@ BILIBILI_USER_AGENT = (
     "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
 )
 _BILIBILI_BV_RE = re.compile(r"BV[0-9A-Za-z]{10}")
-_BILIBILI_AV_RE = re.compile(r"\bav(\d+)\b", re.IGNORECASE)
+_BILIBILI_AV_RE = re.compile(r"\bav(\d+)(?!\d)", re.IGNORECASE)
+# 分 P：链接里的 `?p=5`，或缓存键 `BVxxxxxxxxxx_p5`（见 bilibili_cache_key）
+_BILIBILI_PART_QS_RE = re.compile(r"[?&]p=(\d+)")
+_BILIBILI_PART_KEY_RE = re.compile(r"(?:BV[0-9A-Za-z]{10}|av\d+)_p(\d+)\s*$", re.IGNORECASE)
 
 # ⚠️ B 站相关请求**一律走 bili 模块的 curl_cffi 会话**（bili.bili_get / get_json /
 # resolve_short_url）：标准库 urllib 的 TLS 指纹会被 B 站风控判定为脚本，直接返回
@@ -182,33 +185,56 @@ def _resolve_url(url: str) -> str:
     return bili.resolve_short_url(url)
 
 
-def extract_bilibili_id(url: str) -> Tuple[Optional[str], Optional[int]]:
-    """Extract a (bvid, aid) pair from a Bilibili URL, resolving short links."""
-    host = urlparse(url).netloc.lower()
+def parse_bilibili(value: str) -> Tuple[Optional[str], Optional[int], int]:
+    """解析 B 站链接/BV 号 → (bvid, aid, part)；短链会先展开。part 从 1 数起，缺省 1。
+
+    分 P 视频（`?p=5`）每一 P 画面不同，必须把 P 号一路带到下载/缓存，
+    否则不管点哪一 P 都只会拿到第 1 P。
+    """
+    value = (value or "").strip()
+    host = urlparse(value).netloc.lower()
     if "b23.tv" in host:
         try:
-            url = _resolve_url(url)
+            value = _resolve_url(value)
         except Exception:
-            url = url
+            pass
 
-    match = _BILIBILI_BV_RE.search(url)
+    part = 1
+    m = _BILIBILI_PART_QS_RE.search(value) or _BILIBILI_PART_KEY_RE.search(value)
+    if m:
+        part = max(1, int(m.group(1)))
+
+    match = _BILIBILI_BV_RE.search(value)
     if match:
-        return match.group(0), None
-
-    match = _BILIBILI_AV_RE.search(url)
+        return match.group(0), None, part
+    match = _BILIBILI_AV_RE.search(value)
     if match:
-        return None, int(match.group(1))
+        return None, int(match.group(1)), part
+    return None, None, 1
 
-    return None, None
+
+def extract_bilibili_id(url: str) -> Tuple[Optional[str], Optional[int]]:
+    """Extract a (bvid, aid) pair from a Bilibili URL, resolving short links."""
+    bvid, aid, _part = parse_bilibili(url)
+    return bvid, aid
+
+
+def bilibili_cache_key(bvid: Optional[str], aid: Optional[int], part: int = 1) -> str:
+    """缓存目录名：第 1 P 仍是 `BVxxx`（兼容旧缓存），其余是 `BVxxx_p5`。"""
+    base = bvid or f"av{aid}"
+    return base if part <= 1 else f"{base}_p{part}"
 
 
 def normalize_bilibili_url(value: str) -> str:
-    """Turn a bare Bilibili id (BV…/av…) into a canonical video URL."""
-    value = (value or "").strip()
-    bvid, aid = extract_bilibili_id(value)
+    """Turn a bare Bilibili id (BV…/av…) or a full link into a canonical video URL.
+
+    分 P（p>1）保留 `?p=N`；p=1 与单 P 视频不带参数。
+    """
+    bvid, aid, part = parse_bilibili(value)
     if not bvid and not aid:
         raise ValueError("请输入有效的 Bilibili BV 号。")
-    return f"https://www.bilibili.com/video/{bvid or f'av{aid}'}"
+    url = f"https://www.bilibili.com/video/{bvid or f'av{aid}'}"
+    return url if part <= 1 else f"{url}?p={part}"
 
 
 def _bilibili_api_json(url: str) -> Dict[str, Any]:
@@ -222,8 +248,8 @@ def _bilibili_api_json(url: str) -> Dict[str, Any]:
 
 
 def probe_bilibili_metadata(url: str) -> Tuple[VideoMetadata, Optional[float]]:
-    """Fetch title, uploader and duration for a Bilibili video URL."""
-    bvid, aid = extract_bilibili_id(url)
+    """Fetch title, uploader and duration for a Bilibili video URL（分 P 取该 P 的标题与时长）。"""
+    bvid, aid, part = parse_bilibili(url)
     if not bvid and not aid:
         raise ValueError("无法在此 Bilibili 链接中找到视频 ID。")
 
@@ -237,12 +263,26 @@ def probe_bilibili_metadata(url: str) -> Tuple[VideoMetadata, Optional[float]]:
 
     info = data.get("data") or {}
     owner = info.get("owner") or {}
+    title = info.get("title")
     duration = info.get("duration")
+
+    pages = info.get("pages") or []
+    if len(pages) > 1:
+        if part > len(pages):
+            raise ValueError(f"该视频只有 {len(pages)} 个分 P，没有第 {part} P。")
+        page = pages[part - 1] or {}
+        part_name = (page.get("part") or "").strip()
+        title = f"{title} P{part}" + (f" {part_name}" if part_name else "")
+        if page.get("duration") is not None:
+            duration = page.get("duration")
+    elif part > 1:
+        raise ValueError("该视频不是分 P 视频，没有第 %d P。" % part)
+
     duration_float = float(duration) if duration is not None else None
 
-    canonical = f"https://www.bilibili.com/video/{bvid or f'av{aid}'}"
+    canonical = normalize_bilibili_url(f"{bvid or f'av{aid}'}_p{part}" if part > 1 else (bvid or f"av{aid}"))
     metadata = build_video_metadata(
-        raw_title=info.get("title"),
+        raw_title=title,
         channel=owner.get("name"),
         source_url=canonical,
     )
@@ -1082,32 +1122,150 @@ _DEFAULT_FONT_FILES = [
 ]
 
 
-def load_font(size: int, family: Optional[str] = None):
-    # 跨平台候选目录（macOS 中文字体多位于 System/Library/Fonts 及其
-    # Supplemental 子目录；Windows 位于 Fonts；Linux 常见于 /usr/share/fonts）。
-    candidate_dirs = [
+def _font_dirs() -> List[Path]:
+    """跨平台候选目录（macOS 中文字体多位于 System/Library/Fonts 及其
+    Supplemental 子目录；Windows 位于 Fonts；Linux 常见于 /usr/share/fonts）。"""
+    return [
         Path("/System/Library/Fonts"),
         Path("/System/Library/Fonts/Supplemental"),
         Path("/Library/Fonts"),
         Path(os.environ.get("WINDIR", r"C:\Windows")) / "Fonts",
         Path("/usr/share/fonts/opentype"),
+        Path("/usr/share/fonts/opentype/noto"),
         Path("/usr/share/fonts/truetype"),
+        Path("/usr/share/fonts/truetype/noto"),
+        Path("/usr/share/fonts/truetype/nanum"),
+        Path("/usr/share/fonts/truetype/wqy"),
         Path.home() / "Library" / "Fonts",
         Path("."),
     ]
-    # 若指定了字体族,优先其专属文件；随后无论如何都按兜底顺序（含各平台
-    # 中文字体）继续找,保证中文能命中一款可用的 CJK 字体。
-    names = list(_FONT_FILES.get(family or "", [])) + _DEFAULT_FONT_FILES
 
+
+def _open_font(names: List[str], size: int):
     for name in names:
-        for font_path in (Path(d) / name for d in candidate_dirs):
+        for font_path in (Path(d) / name for d in _font_dirs()):
             try:
                 if font_path.is_file():
                     return ImageFont.truetype(str(font_path), size)
             except OSError:
                 continue
+    return None
 
-    return ImageFont.load_default()
+
+def load_font(size: int, family: Optional[str] = None):
+    # 若指定了字体族,优先其专属文件；随后无论如何都按兜底顺序（含各平台
+    # 中文字体）继续找,保证中文能命中一款可用的 CJK 字体。
+    names = list(_FONT_FILES.get(family or "", [])) + _DEFAULT_FONT_FILES
+    return _open_font(names, size) or ImageFont.load_default()
+
+
+# 主字体缺字（豆腐块）时逐字回退用的字体，按“覆盖面”排序：
+# 韩文 → 日文 → 全字符集。主字体（如 macOS 的 Hiragino Sans GB）只有简/繁中文，没有谚文和假名。
+_FALLBACK_FONT_FILES = [
+    # macOS
+    "AppleSDGothicNeo.ttc",            # 韩文
+    "AppleGothic.ttf",                 # 韩文（旧系统）
+    "Hiragino Sans GB.ttc",
+    "Hiragino Kaku Gothic ProN.ttc",   # 日文
+    "ヒラギノ角ゴシック W3.ttc",
+    "PingFang.ttc",
+    "Arial Unicode.ttf",
+    # Windows
+    "malgun.ttf",                      # 韩文
+    "YuGothR.ttc",
+    "msgothic.ttc",
+    "msjh.ttc",
+    "seguisym.ttf",
+    # Linux
+    "NotoSansCJK-Regular.ttc",
+    "NotoSansCJKkr-Regular.otf",
+    "NanumGothic.ttf",
+    "wqy-zenhei.ttc",
+    "DejaVuSans.ttf",
+]
+
+
+class FontStack:
+    """主字体 + 回退字体：逐字挑第一个真有该字形的字体来画。
+
+    Pillow 的 `ImageFont` 只认单个字体文件，缺字会画成豆腐块（□）。
+    标题里混了韩文/日文/emoji 时，主字体（中文字体）没有这些字，就需要逐字回退。
+    只暴露 `size`（行高计算要用）；绘制与测量走 `text_size` / `draw_text`。
+    """
+
+    def __init__(self, primary, size: int):
+        self.primary = primary
+        self.size = size
+        self._fallbacks: Optional[List[Any]] = None
+        self._pick: Dict[str, Any] = {}
+        self._notdef: Dict[int, Optional[bytes]] = {}
+
+    def _fallback_fonts(self) -> List[Any]:
+        if self._fallbacks is None:
+            fonts = []
+            seen = set()
+            for name in _FALLBACK_FONT_FILES:
+                f = _open_font([name], self.size)
+                if f is not None and name not in seen:
+                    seen.add(name)
+                    fonts.append(f)
+            self._fallbacks = fonts
+        return self._fallbacks
+
+    def _glyph_bytes(self, font, ch: str) -> bytes:
+        """把单字渲染到小画布，返回灰度字节；全黑 = 没画出东西。"""
+        side = max(8, int(self.size * 2))
+        canvas = Image.new("L", (side, side), 0)
+        ImageDraw.Draw(canvas).text((self.size // 4, self.size // 4), ch, fill=255, font=font)
+        return canvas.tobytes()
+
+    def _notdef_bytes(self, font) -> Optional[bytes]:
+        key = id(font)
+        if key not in self._notdef:
+            try:
+                # 一个必然没有字形的码位：主流字体会画出它们的 .notdef（方框/问号）
+                self._notdef[key] = self._glyph_bytes(font, "\U0010FFFF")
+            except Exception:
+                self._notdef[key] = None
+        return self._notdef[key]
+
+    def _has_glyph(self, font, ch: str) -> bool:
+        try:
+            data = self._glyph_bytes(font, ch)
+            if not any(data):
+                return False
+            return data != self._notdef_bytes(font)
+        except Exception:
+            return False
+
+    def font_for(self, ch: str):
+        if ch.isspace() or ord(ch) < 128:
+            return self.primary
+        hit = self._pick.get(ch)
+        if hit is not None:
+            return hit
+        chosen = self.primary
+        if not self._has_glyph(self.primary, ch):
+            for f in self._fallback_fonts():
+                if self._has_glyph(f, ch):
+                    chosen = f
+                    break
+        self._pick[ch] = chosen
+        return chosen
+
+    def runs(self, text: str) -> List[Tuple[str, Any]]:
+        out: List[Tuple[str, Any]] = []
+        for ch in text:
+            f = self.font_for(ch)
+            if out and out[-1][1] is f:
+                out[-1] = (out[-1][0] + ch, f)
+            else:
+                out.append((ch, f))
+        return out
+
+
+def load_font_stack(size: int, family: Optional[str] = None) -> FontStack:
+    return FontStack(load_font(size, family), size)
 
 
 def hex_to_rgb(value: str, default: Tuple[int, int, int] = (24, 24, 24)) -> Tuple[int, int, int]:
@@ -1121,8 +1279,29 @@ def hex_to_rgb(value: str, default: Tuple[int, int, int] = (24, 24, 24)) -> Tupl
 
 
 def text_size(draw: ImageDraw.ImageDraw, text: str, font) -> Tuple[int, int]:
+    if isinstance(font, FontStack):
+        runs = font.runs(text)
+        if len(runs) <= 1:
+            return text_size(draw, text, runs[0][1] if runs else font.primary)
+        width = 0.0
+        height = 0
+        for chunk, f in runs:
+            width += draw.textlength(chunk, font=f)
+            height = max(height, text_size(draw, chunk, f)[1])
+        return int(round(width)), height
     bbox = draw.textbbox((0, 0), text, font=font)
     return bbox[2] - bbox[0], bbox[3] - bbox[1]
+
+
+def draw_text(draw: ImageDraw.ImageDraw, xy: Tuple[float, float], text: str, fill, font) -> None:
+    """画文字；`font` 是 FontStack 时逐段换字体（缺字回退），否则等同 `draw.text`。"""
+    if not isinstance(font, FontStack):
+        draw.text(xy, text, fill=fill, font=font)
+        return
+    x, y = xy
+    for chunk, f in font.runs(text):
+        draw.text((x, y), chunk, fill=fill, font=f)
+        x += draw.textlength(chunk, font=f)
 
 
 def header_line_height(font) -> int:
@@ -1176,9 +1355,9 @@ def draw_first_page_header(
 
     title_size = max(16, int(HEADER_TITLE_SIZE))
     draw = ImageDraw.Draw(page)
-    title_font = load_font(title_size, HEADER_FONT_FAMILY)
-    author_font = load_font(max(14, int(round(title_size * 0.4375))), HEADER_FONT_FAMILY)
-    source_font = load_font(max(12, int(round(title_size * 0.25))), HEADER_FONT_FAMILY)
+    title_font = load_font_stack(title_size, HEADER_FONT_FAMILY)
+    author_font = load_font_stack(max(14, int(round(title_size * 0.4375))), HEADER_FONT_FAMILY)
+    source_font = load_font_stack(max(12, int(round(title_size * 0.25))), HEADER_FONT_FAMILY)
     color = hex_to_rgb(text_color)
     max_text_width = page_width - 2 * margin
 
@@ -1213,14 +1392,14 @@ def draw_first_page_header(
 
     for txt, font in entries:
         w_, _ = text_size(draw, txt, font)
-        draw.text(((page_width - w_) / 2, y), txt, fill=color, font=font)
+        draw_text(draw, ((page_width - w_) / 2, y), txt, color, font)
         y += header_line_height(font) + 8
 
     if url_entries:
         y += 4
         for txt, font in url_entries:
             w_, _ = text_size(draw, txt, font)
-            draw.text((page_width - margin - w_, y), txt, fill=color, font=font)
+            draw_text(draw, (page_width - margin - w_, y), txt, color, font)
             y += header_line_height(font) + 4
 
     return header_height

@@ -189,13 +189,23 @@ def resolve_short_url(url: str, timeout: float = 20) -> str:
         return url
 
 
+def extract_part(url: str) -> int:
+    """链接里的分 P 号（`?p=5` → 5），缺省 1。"""
+    m = re.search(r"[?&]p=(\d+)", url or "")
+    return max(1, int(m.group(1))) if m else 1
+
+
 def _get_cid(url: str, cookie: Optional[str]) -> int:
-    """从 view 接口拿视频 cid（分 P 取第一个）。"""
+    """从 view 接口拿视频 cid；分 P 视频按链接里的 `p` 取对应那一 P（缺省第 1 P）。"""
     bvid = extract_bvid(url)
     view_url = "https://api.bilibili.com/x/web-interface/view?bvid=" + bvid
     data = get_json(view_url, cookie=cookie, timeout=15).get("data") or {}
     pages = data.get("pages") or []
-    cid = (pages[0].get("cid") if pages else None) or data.get("cid")
+    part = extract_part(url)
+    if pages and part > len(pages):
+        raise RuntimeError("该视频只有 %d 个分 P，没有第 %d P。" % (len(pages), part))
+    idx = part - 1 if pages else 0
+    cid = (pages[idx].get("cid") if pages else None) or data.get("cid")
     if not cid:
         raise RuntimeError("无法获取该视频的 cid。")
     return int(cid)

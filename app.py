@@ -35,6 +35,7 @@ from tab_extractor import (
     detect_measure_barlines,
     download_bilibili_video,
     download_youtube_video,
+    bilibili_cache_key,
     extract_bilibili_id,
     extract_note_mask,
     extract_unique_crops,
@@ -43,6 +44,7 @@ from tab_extractor import (
     get_video_duration,
     hex_to_rgb,
     normalize_bilibili_url,
+    parse_bilibili,
     preprocess_for_detection,
     probe_bilibili_metadata,
     probe_youtube_metadata,
@@ -1045,8 +1047,9 @@ def import_source():
             full_url = normalize_bilibili_url(bvid)
             metadata, duration = probe_bilibili_metadata(full_url)
             source_id = uuid.uuid4().hex
-            bvid_id, aid = extract_bilibili_id(full_url)
-            cache_dir = bilibili_cache_dir(bvid_id or f"av{aid}")
+            bvid_id, aid, part_no = parse_bilibili(full_url)
+            cache_key = bilibili_cache_key(bvid_id, aid, part_no)
+            cache_dir = bilibili_cache_dir(cache_key)
             # 提前写占位 state(含标题等元数据)：即使只下载还没截图，也让历史记录能看到该目录
             ensure_placeholder_state(cache_dir, metadata_to_dict(metadata))
             source = {
@@ -1065,7 +1068,7 @@ def import_source():
             if has_img or has_par:
                 # 有可恢复进度(截图或只存过第2步参数)即命中：交前端弹窗选“恢复/从新开始”。
                 source["has_cache"] = True
-                source["cache"] = {"cache_dir": str(cache_dir), "type": "bilibili", "key": bvid_id or f"av{aid}", "title": metadata.display_title or metadata.raw_title}
+                source["cache"] = {"cache_dir": str(cache_dir), "type": "bilibili", "key": cache_key, "title": metadata.display_title or metadata.raw_title}
                 source["params2"] = read_capture_prefs(state)
                 if cached_video is not None:
                     source["download"]["status"] = "done"
@@ -1081,7 +1084,7 @@ def import_source():
                 source["download"]["status"] = "downloading"
                 threading.Thread(
                     target=run_bilibili_download,
-                    args=(source_id, full_url, cache_dir, bvid_id or f"av{aid}"),
+                    args=(source_id, full_url, cache_dir, cache_key),
                     daemon=True,
                 ).start()
         elif upload and upload.filename:
@@ -1496,7 +1499,8 @@ def _bilibili_real_cover(key: str) -> Optional[bytes]:
         return cached[1]
     try:
         import bili as _bili
-        url = "https://api.bilibili.com/x/web-interface/view?bvid=" + key
+        # 缓存键可能带分 P 后缀（BVxxx_p5）；封面取整个视频的，只认 BV 号本体
+        url = "https://api.bilibili.com/x/web-interface/view?bvid=" + key.split("_p")[0]
         r = _bili._session.get(url, timeout=8)
         r.raise_for_status()
         pic = (r.json().get("data") or {}).get("pic")
